@@ -1,9 +1,11 @@
 name: release
 
-# Triggered by pushing a version tag (v1.2.3). Also runnable by hand from
-# the Actions tab for dry-runs / re-builds. Produces standalone binaries
-# for macOS, Linux, and Windows, a SHA256SUMS file, a GitHub Release, and
-# (on tags only) an npm publish.
+# Cut a release by pushing a version tag (e.g. `v0.1.0`). Can also be run
+# from the Actions tab (workflow_dispatch) for a dry-run rebuild.
+#
+# Pipeline: verify (full CI) -> cross-platform standalone binaries (Bun) ->
+# GitHub Release with SHA256SUMS + auto-generated notes -> npm publish
+# (tag pushes only, when an NPM_TOKEN secret is configured).
 on:
   push:
     tags:
@@ -11,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release against (e.g. v0.1.0)'
+        description: 'Tag/version to release against (e.g. v0.1.0)'
         required: true
 
 permissions:
@@ -22,27 +24,38 @@ concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
 jobs:
-  # One artifact per OS/arch. Bun cross-compiles all targets from a single
-  # Linux host, so the whole matrix runs without spinning up macOS/Windows
-  # runners — faster and cheaper than native-per-OS builds.
+  # Gate: never ship anything unless the full suite is green.
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm run ci # typecheck -> lint -> test -> build
+
+  # One artifact per OS/arch. Bun cross-compiles every target from a single
+  # Linux host, so the whole matrix runs without macOS/Windows runners.
   binaries:
     name: build ${{ matrix.name }}
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: bun-darwin-arm64
-            name: pentesterflow-darwin-arm64
-          - target: bun-darwin-x64
-            name: pentesterflow-darwin-x64
-          - target: bun-linux-x64
-            name: pentesterflow-linux-x64
-          - target: bun-linux-arm64
-            name: pentesterflow-linux-arm64
-          - target: bun-windows-x64
-            name: pentesterflow-windows-x64.exe
+          - { target: bun-darwin-arm64, name: pentesterflow-darwin-arm64 }
+          - { target: bun-darwin-x64, name: pentesterflow-darwin-x64 }
+          - { target: bun-linux-x64, name: pentesterflow-linux-x64 }
+          - { target: bun-linux-arm64, name: pentesterflow-linux-arm64 }
+          - { target: bun-windows-x64, name: pentesterflow-windows-x64.exe }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,8 +66,16 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - name: Stamp version into the binary
+        run: |
+          VER="${RELEASE_TAG#v}"
+          # The Bun-compiled binary doesn't run tsup's --define, so it reads
+          # the FALLBACK in version.ts. Patch it to the release version so
+          # `pentesterflow --version` reports correctly. No-op if unmatched.
+          sed -i "s/const FALLBACK = 'dev';/const FALLBACK = '${VER}';/" src/version/version.ts
       - name: Compile standalone binary
         run: |
+          mkdir -p dist-bin
           bun build src/cli/index.ts \
             --compile \
             --minify \
@@ -69,10 +90,8 @@ jobs:
           if-no-files-found: error
 
   # Collect every binary + a combined SHA256SUMS into one GitHub Release.
-  # Doing this in a single job (rather than per-matrix-entry) avoids racing
-  # release creation across the matrix.
   release:
-    name: publish github release
+    name: github release
     needs: binaries
     runs-on: ubuntu-latest
     steps:
@@ -88,18 +107,22 @@ jobs:
           echo "Release assets:" && ls -la
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
             dist-bin/*
 
-  # npm publish runs only for real tag pushes (not manual dry-runs) so a
-  # hand-triggered binary rebuild can't accidentally publish a package.
+  # npm publish runs only for real tag pushes (not manual dry-runs) and only
+  # when an NPM_TOKEN secret exists, so the GitHub Release never fails just
+  # because publishing isn't configured yet.
   npm:
     name: publish npm
+    needs: verify
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -108,7 +131,14 @@ jobs:
           registry-url: https://registry.npmjs.org
           cache: npm
       - run: npm ci
-      - run: npm run ci
-      - run: npm publish --provenance --access public
+      - name: Stamp version from tag
+        run: npm pkg set version="${RELEASE_TAG#v}"
+      - run: npm run build
+      - name: Publish to npm
+        if: env.NPM_TOKEN != ''
+        run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish skipped
+        if: env.NPM_TOKEN == ''
+        run: echo "NPM_TOKEN secret not set — skipping npm publish. The GitHub Release was still created."
