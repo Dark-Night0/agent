@@ -124,6 +124,59 @@ ${JSON.stringify({
         return;
       }
 
+      if (body.model === 'content-qwen-action-tool-call') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                action: 'http',
+                action_input: { url: 'https://x.example.com/action' },
+              }),
+            },
+            done: true,
+          }),
+        );
+        return;
+      }
+
+      if (body.model === 'content-function-string-tool-call') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                function: 'http',
+                parameters: { url: 'https://x.example.com/function-string' },
+              }),
+            },
+            done: true,
+          }),
+        );
+        return;
+      }
+
+      if (body.model === 'content-singular-tool-call') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            message: {
+              role: 'assistant',
+              content: JSON.stringify({
+                tool_call: {
+                  name: 'http',
+                  args: { url: 'https://x.example.com/singular' },
+                },
+              }),
+            },
+            done: true,
+          }),
+        );
+        return;
+      }
+
       // Default non-streaming response.
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
@@ -263,6 +316,64 @@ describe('OllamaClient', () => {
 
     expect(out.message.toolCalls).toBeUndefined();
     expect(out.finishReason).toBe('stop');
+  });
+
+  it('parses Qwen-style action/action_input content tool calls', async () => {
+    const c = new OllamaClient(baseURL, 'content-qwen-action-tool-call');
+    const out = await c.chat({
+      model: 'content-qwen-action-tool-call',
+      messages: [{ role: 'user', content: 'fetch it' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'http', description: 'http tool', parameters: {} },
+        },
+      ],
+    });
+
+    expect(out.message.toolCalls).toHaveLength(1);
+    expect(out.message.toolCalls?.[0]?.function.arguments).toBe(
+      '{"url":"https://x.example.com/action"}',
+    );
+    expect(out.finishReason).toBe('tool_calls');
+  });
+
+  it('parses function string and parameters content tool calls', async () => {
+    const c = new OllamaClient(baseURL, 'content-function-string-tool-call');
+    const out = await c.chat({
+      model: 'content-function-string-tool-call',
+      messages: [{ role: 'user', content: 'fetch it' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'http', description: 'http tool', parameters: {} },
+        },
+      ],
+    });
+
+    expect(out.message.toolCalls).toHaveLength(1);
+    expect(out.message.toolCalls?.[0]?.function.arguments).toBe(
+      '{"url":"https://x.example.com/function-string"}',
+    );
+  });
+
+  it('parses singular tool_call content tool calls', async () => {
+    const c = new OllamaClient(baseURL, 'content-singular-tool-call');
+    const out = await c.chat({
+      model: 'content-singular-tool-call',
+      messages: [{ role: 'user', content: 'fetch it' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'http', description: 'http tool', parameters: {} },
+        },
+      ],
+    });
+
+    expect(out.message.toolCalls).toHaveLength(1);
+    expect(out.message.toolCalls?.[0]?.function.arguments).toBe(
+      '{"url":"https://x.example.com/singular"}',
+    );
   });
 
   it('ping succeeds against a live server', async () => {

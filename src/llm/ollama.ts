@@ -267,7 +267,16 @@ function normalizeToolCalls(value: unknown, knownTools: Set<string>): OllamaTool
   }
   if (!isRecord(value)) return [];
 
-  const calls = value.tool_calls ?? value.toolCalls;
+  const calls =
+    value.tool_calls ??
+    value.toolCalls ??
+    value.tool_call ??
+    value.toolCall ??
+    value.function_call ??
+    value.functionCall;
+  if (isRecord(calls)) {
+    return normalizeToolCalls(calls, knownTools);
+  }
   if (Array.isArray(calls)) {
     return calls.flatMap((item) => normalizeToolCalls(item, knownTools));
   }
@@ -277,9 +286,28 @@ function normalizeToolCalls(value: unknown, knownTools: Set<string>): OllamaTool
     const call = normalizeNamedCall(functionValue.name, functionValue.arguments, knownTools);
     return call ? [call] : [];
   }
+  if (typeof functionValue === 'string') {
+    const args = value.arguments ?? value.args ?? value.parameters ?? value.input ?? {};
+    const call = normalizeNamedCall(functionValue, args, knownTools);
+    return call ? [call] : [];
+  }
 
-  const name = value.name ?? value.tool ?? value.tool_name ?? value.toolName;
-  const args = value.arguments ?? value.args ?? value.parameters ?? value.input ?? {};
+  const name =
+    value.name ??
+    value.tool ??
+    value.tool_name ??
+    value.toolName ??
+    value.action ??
+    value.action_name ??
+    value.actionName;
+  const args =
+    value.arguments ??
+    value.args ??
+    value.parameters ??
+    value.input ??
+    value.action_input ??
+    value.actionInput ??
+    {};
   const call = normalizeNamedCall(name, args, knownTools);
   return call ? [call] : [];
 }
