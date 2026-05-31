@@ -11,9 +11,12 @@ describe('displayToolName', () => {
   it('maps load_skill to "Skill"', () => {
     expect(displayToolName('load_skill')).toBe('Skill');
   });
+  it('maps confirm_finding to "Confirmed Finding"', () => {
+    expect(displayToolName('confirm_finding')).toBe('Confirmed Finding');
+  });
   it('passes unknown tools through unchanged', () => {
     expect(displayToolName('shell')).toBe('shell');
-    expect(displayToolName('confirm_finding')).toBe('confirm_finding');
+    expect(displayToolName('not_real')).toBe('not_real');
   });
 });
 

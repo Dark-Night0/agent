@@ -4,6 +4,7 @@
 // names and args.
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  confirm_finding: 'Confirmed Finding',
   load_skill: 'Skill',
   mcp_browser_browser_navigate: 'Browser',
 };

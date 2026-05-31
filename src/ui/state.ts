@@ -25,6 +25,8 @@ export interface TranscriptEntry {
   expanded?: boolean;
   /** Optional display prefix override for entries with custom transcript chrome. */
   prefix?: string;
+  /** Optional display color override for entries that need semantic emphasis. */
+  color?: string;
 }
 
 export interface AppState {
@@ -194,6 +196,10 @@ function isShellTool(name: string): boolean {
   return name === 'shell' || name === 'bash' || name === 'BashTool';
 }
 
+function toolCallColor(name: string): string | undefined {
+  return name === 'confirm_finding' ? 'red' : undefined;
+}
+
 function shellDisplayName(name: string): string {
   return name === 'shell' ? 'Shell' : 'Bash';
 }
@@ -303,6 +309,7 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
             kind: 'tool-call',
             text: formatToolCallText(ev.name, ev.argsJSON),
             prefix: isShellTool(ev.name) ? '⏺ ' : undefined,
+            color: toolCallColor(ev.name),
           },
         ],
       };

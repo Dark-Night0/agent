@@ -96,6 +96,13 @@ describe('buildSystemPrompt', () => {
     expect(p).not.toContain('Tooling profile: scanners enabled');
   });
 
+  it('warns against GNU-only grep -P in shell commands', () => {
+    const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
+    expect(p).toContain('macOS/BSD and Linux');
+    expect(p).toContain('grep -P');
+    expect(p).toContain('grep -E');
+  });
+
   it("appends the scanner-override stanza when tooling profile is 'full'", () => {
     const p = buildSystemPrompt({
       skills: new Registry(),

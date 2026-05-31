@@ -8,6 +8,7 @@ import { Chalk } from 'chalk';
 import { Box, useApp, useInput, useStdout } from 'ink';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { Agent } from '../agent/agent.js';
+import { type AgentEvent, MaxStepsError } from '../agent/events.js';
 import { findActiveMention, listMentionDir, parseMentionPath } from '../agent/mentions.js';
 import type { Backend } from '../config/config.js';
 import { listModels } from '../llm/models.js';
@@ -136,6 +137,87 @@ export function App({
   const [historyIdx, setHistoryIdx] = useState<number | null>(null);
   const HISTORY_CAP = 500;
 
+  const isMaxStepsError = useCallback((err: Error): err is MaxStepsError => {
+    return err instanceof MaxStepsError || err.name === 'MaxStepsError';
+  }, []);
+
+  const runAgentTurn = useCallback(
+    (value: string, opts?: { transcriptUserText?: string; systemText?: string }) => {
+      if (opts?.transcriptUserText) {
+        dispatch({ type: 'append', entry: { kind: 'user', text: opts.transcriptUserText } });
+      }
+      if (opts?.systemText) {
+        dispatch({ type: 'append', entry: { kind: 'system', text: opts.systemText } });
+      }
+
+      dispatch({ type: 'set-busy', busy: true });
+      const ctl = new AbortController();
+      runCtl.current = ctl;
+
+      const handleEvent = (ev: AgentEvent) => {
+        if (ev.type === 'error' && isMaxStepsError(ev.err)) {
+          const steps = ev.err.steps;
+          dispatch({
+            type: 'append',
+            entry: {
+              kind: 'system',
+              text: `Reached max steps (${steps}) without finishing.`,
+            },
+          });
+          dispatch({
+            type: 'set-ask',
+            req: {
+              question: {
+                header: 'Max steps',
+                question: 'The agent reached the per-turn step limit. Continue or stop?',
+                options: [
+                  {
+                    label: 'Continue',
+                    description: 'Start another turn and continue from the current session state.',
+                  },
+                  {
+                    label: 'Stop',
+                    description: 'Leave the session as-is so you can decide the next command.',
+                  },
+                ],
+              },
+              resolve: (label) => {
+                dispatch({ type: 'set-ask', req: null });
+                if (label === 'Continue') {
+                  runAgentTurn('Continue from where you stopped and finish the current task.', {
+                    systemText: 'continuing after max-steps limit',
+                  });
+                  return;
+                }
+                dispatch({
+                  type: 'append',
+                  entry: { kind: 'system', text: 'stopped at max steps' },
+                });
+              },
+              reject: () => {
+                dispatch({ type: 'set-ask', req: null });
+                dispatch({
+                  type: 'append',
+                  entry: { kind: 'system', text: 'stopped at max steps' },
+                });
+              },
+            },
+          });
+          return;
+        }
+        dispatch({ type: 'agent-event', event: ev });
+      };
+
+      void agent.run(value, ctl.signal, handleEvent).catch((err: unknown) => {
+        dispatch({
+          type: 'append',
+          entry: { kind: 'error', text: err instanceof Error ? err.message : String(err) },
+        });
+      });
+    },
+    [agent, isMaxStepsError],
+  );
+
   // Bridge publishers wired exactly once so prompts surface as modals.
   useEffect(() => {
     bindPermPublisher?.((req) => dispatch({ type: 'set-perm', req }));
@@ -252,18 +334,7 @@ export function App({
         );
         if (handled) return;
       }
-      dispatch({ type: 'append', entry: { kind: 'user', text: value } });
-      dispatch({ type: 'set-busy', busy: true });
-      const ctl = new AbortController();
-      runCtl.current = ctl;
-      void agent
-        .run(value, ctl.signal, (ev) => dispatch({ type: 'agent-event', event: ev }))
-        .catch((err: unknown) => {
-          dispatch({
-            type: 'append',
-            entry: { kind: 'error', text: err instanceof Error ? err.message : String(err) },
-          });
-        });
+      runAgentTurn(value, { transcriptUserText: value });
     },
     [
       agent,
@@ -275,6 +346,7 @@ export function App({
       applyProvider,
       persistDisabledSkills,
       onSkillCreated,
+      runAgentTurn,
     ],
   );
 

@@ -109,7 +109,7 @@ export function EntryView({ entry }: { entry: TranscriptEntry }): JSX.Element {
         // role's color.
         return (
           // biome-ignore lint/suspicious/noArrayIndexKey: rows are stable & never reordered
-          <Text key={j} color={s.color}>
+          <Text key={j} color={entry.color ?? s.color}>
             {row.text ? `${indent}${row.text}` : ''}
           </Text>
         );

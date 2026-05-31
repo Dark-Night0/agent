@@ -32,6 +32,51 @@ export const DENY_PATTERNS: RegExp[] = [
   /\bfind\b[^|;&\n]*\s-exec\s+rm\b/i, // find / -exec rm
 ];
 
+const PORTABILITY_PATTERNS: Array<{ re: RegExp; message: string }> = [
+  {
+    re: /\bgrep\s+(?:-[A-Za-z]*P[A-Za-z]*|--perl-regexp)\b/,
+    message:
+      'grep -P/--perl-regexp is GNU-only and fails on macOS/BSD grep. Use grep -E, awk, sed, perl -ne, or jq instead.',
+  },
+  {
+    re: /\bsed\s+-[A-Za-z]*r[A-Za-z]*\b/,
+    message: 'sed -r is GNU-only. Use sed -E for portable extended regular expressions.',
+  },
+  {
+    re: /\bbase64\s+[^|;&\n]*-[A-Za-z]*w\d*[A-Za-z]*\b/,
+    message:
+      'base64 -w is GNU-only. Omit wrapping flags on macOS/BSD, or strip newlines with tr -d "\\n".',
+  },
+  {
+    re: /\breadlink\s+-[A-Za-z]*f[A-Za-z]*\b/,
+    message:
+      'readlink -f is GNU-only. Use python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" <path> or pwd -P based logic.',
+  },
+  {
+    re: /\bdate\s+[^|;&\n]*-[A-Za-z]*d[A-Za-z]*\b/,
+    message:
+      'date -d is GNU-only. Use portable shell date handling or a short python3/perl snippet for date parsing.',
+  },
+  {
+    re: /\bxargs\s+-[A-Za-z]*r[A-Za-z]*\b/,
+    message:
+      'xargs -r is GNU-only. Guard input explicitly before xargs for macOS/BSD compatibility.',
+  },
+  {
+    re: /\bstat\s+-c\b/,
+    message: 'stat -c is GNU-only. Use stat -f on macOS/BSD or a portable python3 os.stat snippet.',
+  },
+  {
+    re: /\bsort\s+-[A-Za-z]*V[A-Za-z]*\b/,
+    message: 'sort -V is GNU-only. Use plain sort or a small python3 version-sort snippet.',
+  },
+  {
+    re: /(^|[|;&\s])timeout\s+\d/,
+    message:
+      'timeout is not available by default on macOS. Use the tool timeout_seconds argument or implement timeout in python3.',
+  },
+];
+
 export class ShellTool implements Tool {
   private readonly shellPath: string;
   private readonly toolName: string;
@@ -48,6 +93,7 @@ export class ShellTool implements Tool {
   description(): string {
     return [
       'Run a shell command via /bin/sh -c on the local machine. Primary use case is curl + standard Unix utilities (jq, grep, awk, sed, head, sort, uniq) for HTTP testing, file inspection, and bash one-liners. The user will be prompted to approve each command. Capture concise output — pipe through `head` for huge outputs. Do not run interactive commands. Authorized engagements only.',
+      'Write portable macOS/BSD + Linux commands. Avoid GNU-only flags such as `grep -P`; prefer `grep -E`, `awk`, `sed`, `perl -ne`, or `jq` for extraction.',
       '',
       'Default to curl for HTTP work; only use specialized scanners (ffuf, nuclei, sqlmap, etc.) when the user explicitly asks for them.',
     ].join('\n');
@@ -88,6 +134,11 @@ export class ShellTool implements Tool {
     for (const re of DENY_PATTERNS) {
       if (re.test(cmdStr)) {
         throw new Error(`command blocked by denylist (matched ${re.source})`);
+      }
+    }
+    for (const { re, message } of PORTABILITY_PATTERNS) {
+      if (re.test(cmdStr)) {
+        throw new Error(`command blocked for portability: ${message}`);
       }
     }
 

@@ -36,6 +36,13 @@ describe('shell denylist', () => {
 });
 
 describe('ShellTool.run', () => {
+  it('describes portable grep usage and avoids grep -P guidance', () => {
+    const desc = new ShellTool().description();
+    expect(desc).toContain('grep -P');
+    expect(desc).toContain('grep -E');
+    expect(desc).toContain('macOS/BSD');
+  });
+
   it('executes a benign command and returns stdout', async () => {
     const t = new ShellTool();
     const out = await t.run(
@@ -53,6 +60,38 @@ describe('ShellTool.run', () => {
     await expect(
       t.run({ command: 'rm -rf /' }, new AbortController().signal, new AlwaysAllow()),
     ).rejects.toThrow(/blocked by denylist/);
+  });
+
+  it('blocks known GNU-only commands with portable replacement guidance', async () => {
+    const t = new ShellTool();
+    const cases = [
+      { command: "printf 'abc' | grep -P 'a'", message: /grep -P/ },
+      { command: "printf 'abc' | grep --perl-regexp 'a'", message: /perl-regexp/ },
+      { command: "printf 'abc' | sed -r 's/a/A/'", message: /sed -r/ },
+      { command: "printf 'abc' | base64 -w0", message: /base64 -w/ },
+      { command: 'readlink -f ./package.json', message: /readlink -f/ },
+      { command: 'date -d tomorrow', message: /date -d/ },
+      { command: "printf '' | xargs -r echo", message: /xargs -r/ },
+      { command: 'stat -c %s package.json', message: /stat -c/ },
+      { command: "printf '1.2\\n1.10\\n' | sort -V", message: /sort -V/ },
+      { command: 'timeout 2 curl -s https://example.com', message: /timeout/ },
+    ];
+
+    for (const tc of cases) {
+      await expect(
+        t.run({ command: tc.command }, new AbortController().signal, new AlwaysAllow()),
+      ).rejects.toThrow(tc.message);
+    }
+  });
+
+  it('allows portable grep and sed alternatives', async () => {
+    const t = new ShellTool();
+    const out = await t.run(
+      { command: "printf 'abc\\n' | grep -E 'a.c' | sed -E 's/a/A/'" },
+      new AbortController().signal,
+      new AlwaysAllow(),
+    );
+    expect(out).toContain('Abc');
   });
 
   it('errors when command is missing', async () => {

@@ -128,6 +128,27 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.prefix).toBe('⏺ ');
   });
 
+  it('renders confirmed findings with a red semantic label', () => {
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'confirm_finding',
+        args: {},
+        argsJSON: JSON.stringify({
+          severity: 'low',
+          title: 'Information Disclosure - PHP Version in Response Headers',
+        }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toBe(
+      'Confirmed Finding (low) Information Disclosure - PHP Version in Response Headers',
+    );
+    expect(last?.color).toBe('red');
+  });
+
   it('strips raw control chars from the preview', () => {
     const args = '{"raw":"line1\nline2\tcol"}';
     const out = reducer(seed(), {
