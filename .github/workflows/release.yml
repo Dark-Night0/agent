@@ -93,6 +93,7 @@ jobs:
   release:
     name: github release
     needs: binaries
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -112,6 +113,28 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist-bin/*
+
+  dry-run:
+    name: dry-run artifacts
+    needs: binaries
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-bin
+          merge-multiple: true
+      - name: Aggregate checksums
+        run: |
+          cd dist-bin
+          cat ./*.sha256 > SHA256SUMS
+          rm -f ./*.sha256
+          echo "Dry-run assets:" && ls -la
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run-${{ env.RELEASE_TAG }}
+          path: dist-bin/*
+          if-no-files-found: error
 
   # npm publish runs only for real tag pushes (not manual dry-runs) and only
   # when an NPM_TOKEN secret exists, so the GitHub Release never fails just
