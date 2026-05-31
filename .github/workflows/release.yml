@@ -1,13 +1,17 @@
 name: release
 
-# Cut a release by pushing a version tag (e.g. `v0.1.0`). Can also be run
-# from the Actions tab (workflow_dispatch) for a dry-run rebuild.
+# Cut a versioned release by pushing a version tag (e.g. `v0.1.0`).
+# Every push to main also refreshes the rolling `latest` release so
+# installers and `/update latest` can pick up fixes without a manual tag.
+# Can also be run from the Actions tab (workflow_dispatch) for a dry-run rebuild.
 #
 # Pipeline: verify (full CI) -> cross-platform standalone binaries (Bun) ->
 # GitHub Release with SHA256SUMS + auto-generated notes -> npm publish
 # (tag pushes only, when an NPM_TOKEN secret is configured).
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -25,7 +29,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  RELEASE_TAG: ${{ github.event.inputs.tag || (github.ref == 'refs/heads/main' && 'latest') || github.ref_name }}
 
 jobs:
   # Gate: never ship anything unless the full suite is green.
@@ -68,7 +72,11 @@ jobs:
           bun-version: latest
       - name: Stamp version into the binary
         run: |
-          VER="${RELEASE_TAG#v}"
+          if [[ "${RELEASE_TAG}" == v* ]]; then
+            VER="${RELEASE_TAG#v}"
+          else
+            VER="main-${GITHUB_SHA::7}"
+          fi
           # The Bun-compiled binary doesn't run tsup's --define, so it reads
           # the FALLBACK in version.ts. Patch it to the release version so
           # `pentesterflow --version` reports correctly. No-op if unmatched.
@@ -93,9 +101,17 @@ jobs:
   release:
     name: github release
     needs: binaries
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Move rolling latest tag
+        if: github.ref == 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${RELEASE_TAG}" --force
       - uses: actions/download-artifact@v4
         with:
           path: dist-bin
@@ -109,8 +125,13 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ github.ref == 'refs/heads/main' && 'Latest main build' || env.RELEASE_TAG }}
+          body: ${{ github.ref == 'refs/heads/main' && format('Rolling release for main commit {0}.', github.sha) || '' }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+          overwrite_files: true
+          make_latest: true
           files: |
             dist-bin/*
 
