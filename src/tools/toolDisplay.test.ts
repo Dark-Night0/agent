@@ -14,6 +14,9 @@ describe('displayToolName', () => {
   it('maps confirm_finding to "Confirmed Finding"', () => {
     expect(displayToolName('confirm_finding')).toBe('Confirmed Finding');
   });
+  it('maps ask_user to "Ask User"', () => {
+    expect(displayToolName('ask_user')).toBe('Ask User');
+  });
   it('passes unknown tools through unchanged', () => {
     expect(displayToolName('shell')).toBe('shell');
     expect(displayToolName('not_real')).toBe('not_real');
@@ -46,6 +49,26 @@ describe('primaryToolArg', () => {
   });
   it('extracts the skill name for load_skill', () => {
     expect(primaryToolArg('load_skill', { name: 'webvuln' })).toBe('webvuln');
+  });
+  it('summarizes ask_user questions without dumping options JSON', () => {
+    expect(
+      primaryToolArg('ask_user', {
+        questions: [
+          {
+            header: 'Scope',
+            question:
+              'Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+            options: [{ label: 'Passive recon' }, { label: 'Full recon' }],
+          },
+          {
+            question: 'How deep should the testing go?',
+            options: [{ label: 'Passive only' }, { label: 'Active web vuln hunt' }],
+          },
+        ],
+      }),
+    ).toBe(
+      'Scope · 2 questions · Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+    );
   });
   it('returns null for unknown tools or missing/empty fields', () => {
     expect(primaryToolArg('http', {})).toBeNull();
@@ -82,9 +105,34 @@ describe('formatToolResult', () => {
       ['loaded skill: webvuln', 'playbook: Web vuln hunting playbook'].join('\n'),
     );
   });
+  it('renders ask_user answers as a readable summary', () => {
+    const result = JSON.stringify({
+      answers: [
+        {
+          question:
+            'Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+          answer: 'Full recon: dsquares.com + all mazaya* apexes + pivots',
+        },
+        {
+          question: 'How deep should the testing go?',
+          answer: 'Active web vuln hunt',
+        },
+      ],
+    });
+    expect(formatToolResult('ask_user', result)).toBe(
+      [
+        'answers:',
+        '- Full recon: dsquares.com + all mazaya* apexes + pivots',
+        '  Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+        '- Active web vuln hunt',
+        '  How deep should the testing go?',
+      ].join('\n'),
+    );
+  });
   it('falls back (null) for other tools or malformed JSON', () => {
     expect(formatToolResult('shell', '{}')).toBeNull();
     expect(formatToolResult('browser_capture_status', 'not json')).toBeNull();
     expect(formatToolResult('load_skill', '# Missing skill heading')).toBeNull();
+    expect(formatToolResult('ask_user', 'not json')).toBeNull();
   });
 });

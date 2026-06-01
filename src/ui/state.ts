@@ -276,6 +276,7 @@ function formatToolCallText(name: string, argsJSON: string): string {
     if (action) return `${shellName} · ${action.title}\n$ ${action.command}`;
     return `${shellName}(${argsPreview})`;
   }
+  if (name === 'ask_user') return `${displayToolName(name)} · ${argsPreview}`;
   return `${displayToolName(name)} ${argsPreview}`;
 }
 

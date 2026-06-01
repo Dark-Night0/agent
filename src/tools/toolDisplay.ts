@@ -4,6 +4,7 @@
 // names and args.
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  ask_user: 'Ask User',
   confirm_finding: 'Confirmed Finding',
   load_skill: 'Skill',
   mcp_browser_browser_navigate: 'Browser',
@@ -41,6 +42,9 @@ export function primaryToolArg(name: string, args: Record<string, unknown>): str
     const skillName = args.name;
     if (typeof skillName === 'string' && skillName) return skillName;
   }
+  if (name === 'ask_user') {
+    return formatAskUserCall(args);
+  }
   return null;
 }
 
@@ -62,6 +66,9 @@ export function formatToolResult(name: string, result: string): string | null {
       return null; // malformed/partial JSON — use the default view
     }
   }
+  if (name === 'ask_user') {
+    return formatAskUserResult(result);
+  }
   return null;
 }
 
@@ -79,4 +86,45 @@ function formatLoadSkillResult(result: string): string | null {
   const lines = [`loaded skill: ${skill}`];
   if (title) lines.push(`playbook: ${title}`);
   return lines.join('\n');
+}
+
+function formatAskUserCall(args: Record<string, unknown>): string | null {
+  const questions = Array.isArray(args.questions) ? args.questions : [];
+  if (questions.length === 0) return null;
+
+  const first = questions[0] as Record<string, unknown>;
+  const header = typeof first.header === 'string' && first.header ? first.header : '';
+  const question = typeof first.question === 'string' && first.question ? first.question : '';
+  const count = questions.length;
+  const countText = `${count} question${count === 1 ? '' : 's'}`;
+
+  if (header && question) return `${header} · ${countText} · ${question}`;
+  if (header) return `${header} · ${countText}`;
+  if (question) return `${countText} · ${question}`;
+  return countText;
+}
+
+function formatAskUserResult(result: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result);
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || !Array.isArray(parsed.answers)) return null;
+
+  const lines = ['answers:'];
+  for (const raw of parsed.answers) {
+    if (!isRecord(raw)) continue;
+    const question = typeof raw.question === 'string' ? raw.question.trim() : '';
+    const answer = typeof raw.answer === 'string' ? raw.answer.trim() : '';
+    if (!answer && !question) continue;
+    if (answer) lines.push(`- ${answer}`);
+    if (question) lines.push(`  ${question}`);
+  }
+  return lines.length > 1 ? lines.join('\n') : null;
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
 }

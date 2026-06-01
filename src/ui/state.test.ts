@@ -149,6 +149,36 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.color).toBe('red');
   });
 
+  it('renders ask_user calls as a compact human prompt summary', () => {
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'ask_user',
+        args: {},
+        argsJSON: JSON.stringify({
+          questions: [
+            {
+              header: 'Scope',
+              question:
+                'Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+              options: [
+                { label: 'Passive only', description: 'No active probing.' },
+                { label: 'Full recon', description: 'Include pivots.' },
+              ],
+            },
+          ],
+        }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toBe(
+      'Ask User · Scope · 1 question · Confirming scope — I want to make sure I test the right surface. Which of these matches the engagem…',
+    );
+    expect(last?.text).not.toContain('"options"');
+  });
+
   it('strips raw control chars from the preview', () => {
     const args = '{"raw":"line1\nline2\tcol"}';
     const out = reducer(seed(), {
@@ -233,6 +263,44 @@ describe('state.reducer tool-result body', () => {
     });
     const last = out.transcript[out.transcript.length - 1];
     expect(last?.text).toBe('[ok] shell (12ms)\n101');
+  });
+
+  it('renders ask_user answers without raw JSON', () => {
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-result',
+        id: 'c1',
+        name: 'ask_user',
+        result: JSON.stringify({
+          answers: [
+            {
+              question:
+                'Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+              answer: 'Full recon: dsquares.com + all mazaya* apexes + pivots',
+            },
+            {
+              question: 'How deep should the testing go?',
+              answer: 'Active web vuln hunt',
+            },
+          ],
+        }),
+        err: '',
+        durationMs: 15742,
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toBe(
+      [
+        '[ok] Ask User (15742ms)',
+        'answers:',
+        '- Full recon: dsquares.com + all mazaya* apexes + pivots',
+        '  Confirming scope — I want to make sure I test the right surface. Which of these matches the engagement?',
+        '- Active web vuln hunt',
+        '  How deep should the testing go?',
+      ].join('\n'),
+    );
+    expect(last?.text).not.toContain('"answers"');
   });
 });
 
