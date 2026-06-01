@@ -29,7 +29,15 @@ import { SLASH_ITEMS, filterSlash } from './slashItems.js';
 import type { Action } from './state.js';
 import { initialState, reducer } from './state.js';
 import { usePing } from './usePing.js';
-import { looksLikePaste, stripPasteMarkers, useTextField } from './useTextField.js';
+import {
+  expandPastedTextMarkers,
+  looksLikePaste,
+  normalizePastedText,
+  pastedTextMarker,
+  shouldCollapsePaste,
+  stripPasteMarkers,
+  useTextField,
+} from './useTextField.js';
 
 /** Mutate the live config + agent client + persist to disk. CLI wires this. */
 export interface ProviderChange {
@@ -137,6 +145,8 @@ export function App({
   const historyDraft = useRef<string>('');
   const [historyIdx, setHistoryIdx] = useState<number | null>(null);
   const HISTORY_CAP = 500;
+  const pastedTextRef = useRef<Map<number, string>>(new Map());
+  const pastedTextSeq = useRef(0);
 
   const isMaxStepsError = useCallback((err: Error): err is MaxStepsError => {
     return err instanceof MaxStepsError || err.name === 'MaxStepsError';
@@ -302,6 +312,7 @@ export function App({
 
   const submit = useCallback(
     (value: string) => {
+      const agentValue = expandPastedTextMarkers(value, pastedTextRef.current);
       // Record the submission in session history before doing anything
       // else. Slash commands are included so /provider, /skills, etc.
       // are recallable too — that matches bash and zsh semantics. Drop
@@ -319,10 +330,10 @@ export function App({
       setHistoryIdx(null);
       historyDraft.current = '';
 
-      if (value.startsWith('/')) {
+      if (agentValue.startsWith('/')) {
         const handled = handleSlash(
           agent,
-          value,
+          agentValue,
           dispatch,
           exit,
           clearScreen,
@@ -335,7 +346,7 @@ export function App({
         );
         if (handled) return;
       }
-      runAgentTurn(value, { transcriptUserText: value });
+      runAgentTurn(agentValue, { transcriptUserText: value });
     },
     [
       agent,
@@ -469,7 +480,15 @@ export function App({
     //     so an embedded newline doesn't auto-submit the half-typed
     //     prompt (and so heredocs / payloads land in one piece).
     if (looksLikePaste(rawInput, key)) {
-      input.insertText(stripPasteMarkers(rawInput));
+      const pasted = normalizePastedText(stripPasteMarkers(rawInput));
+      if (shouldCollapsePaste(pasted)) {
+        pastedTextSeq.current += 1;
+        const id = pastedTextSeq.current;
+        pastedTextRef.current.set(id, pasted);
+        input.insertText(pastedTextMarker(id, pasted));
+        return;
+      }
+      input.insertText(pasted);
       return;
     }
 

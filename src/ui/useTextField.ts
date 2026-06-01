@@ -183,3 +183,28 @@ const PASTE_END = '\x1b[201~';
 export function stripPasteMarkers(s: string): string {
   return s.split(PASTE_START).join('').split(PASTE_END).join('');
 }
+
+export function normalizePastedText(s: string): string {
+  return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+export function shouldCollapsePaste(s: string): boolean {
+  return normalizePastedText(s).includes('\n');
+}
+
+export function pastedTextMarker(id: number, text: string): string {
+  const lineCount = normalizePastedText(text).split('\n').length;
+  return `[Pasted text #${id} +${lineCount} lines]`;
+}
+
+const PASTED_TEXT_MARKER_RE = /\[Pasted text #(\d+) \+\d+ lines\]/g;
+
+export function expandPastedTextMarkers(
+  value: string,
+  pastedTextById: ReadonlyMap<number, string>,
+): string {
+  return value.replace(PASTED_TEXT_MARKER_RE, (marker, idRaw: string) => {
+    const pasted = pastedTextById.get(Number(idRaw));
+    return pasted ?? marker;
+  });
+}

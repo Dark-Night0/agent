@@ -110,6 +110,24 @@ describe('UI slash commands (terminal integration)', () => {
     expect(runSpy.mock.calls[0][0]).toBe('find idors on the api');
   });
 
+  it('collapses multi-line pasted text in the UI but sends the full text', async () => {
+    mounted = renderApp();
+    await tick();
+
+    mounted.stdin.write('line one\nline two\nline three');
+    await tick();
+
+    expect(mounted.lastFrame()).toContain('[Pasted text #1 +3 lines]');
+    expect(mounted.lastFrame()).not.toContain('line two');
+
+    mounted.stdin.write('\r');
+    await tick();
+
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(runSpy.mock.calls[0][0]).toBe('line one\nline two\nline three');
+    expect(mounted.stdout.frames.join('')).toContain('[Pasted text #1 +3 lines]');
+  });
+
   it('/exit is handled as a command, not sent to the agent', async () => {
     mounted = renderApp();
     await tick();

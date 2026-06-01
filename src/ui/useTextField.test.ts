@@ -4,7 +4,16 @@
 // paste-detection predicate.
 
 import { describe, expect, it } from 'vitest';
-import { looksLikePaste, offsetAt, positionOf, stripPasteMarkers } from './useTextField.js';
+import {
+  expandPastedTextMarkers,
+  looksLikePaste,
+  normalizePastedText,
+  offsetAt,
+  pastedTextMarker,
+  positionOf,
+  shouldCollapsePaste,
+  stripPasteMarkers,
+} from './useTextField.js';
 
 describe('positionOf', () => {
   it('handles single-line offsets', () => {
@@ -79,5 +88,33 @@ describe('stripPasteMarkers', () => {
 
   it('passes plain text through unchanged', () => {
     expect(stripPasteMarkers('hello world')).toBe('hello world');
+  });
+});
+
+describe('pasted text markers', () => {
+  it('normalizes pasted CRLF text', () => {
+    expect(normalizePastedText('a\r\nb\rc')).toBe('a\nb\nc');
+  });
+
+  it('collapses only multi-line pasted text', () => {
+    expect(shouldCollapsePaste('single line')).toBe(false);
+    expect(shouldCollapsePaste('line 1\nline 2')).toBe(true);
+  });
+
+  it('builds a compact marker with the paste id and line count', () => {
+    expect(pastedTextMarker(1, 'one\ntwo\nthree')).toBe('[Pasted text #1 +3 lines]');
+  });
+
+  it('expands pasted text markers before submission', () => {
+    const pasted = new Map([[1, 'alpha\nbeta']]);
+    expect(expandPastedTextMarkers('review [Pasted text #1 +2 lines]', pasted)).toBe(
+      'review alpha\nbeta',
+    );
+  });
+
+  it('leaves unknown pasted text markers readable', () => {
+    expect(expandPastedTextMarkers('[Pasted text #2 +9 lines]', new Map())).toBe(
+      '[Pasted text #2 +9 lines]',
+    );
   });
 });
