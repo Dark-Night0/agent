@@ -35,7 +35,7 @@ export interface TranscriptProps {
   /** Frozen snapshot printed once at the top of the log. */
   bannerData: BannerData;
   /** Bumped on /clear so the Static log remounts. */
-  generation: number;
+  generation: number | string;
 }
 
 /** One log item: the one-time banner header, or a transcript entry. */
@@ -49,6 +49,7 @@ const ROLE_STYLES: Record<TranscriptEntry['kind'], { color: string; prefix: stri
   system: { color: 'gray', prefix: '· ' },
   error: { color: 'red', prefix: '! ' },
   finding: { color: 'yellow', prefix: '★ ' },
+  decision: { color: 'cyan', prefix: '· ' },
 };
 
 /** Continuation lines align under the prefix glyph. All prefixes above

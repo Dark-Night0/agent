@@ -22,9 +22,8 @@ describe('state.reducer tool-call preview', () => {
     });
     const last = out.transcript[out.transcript.length - 1];
     expect(last?.kind).toBe('tool-call');
-    expect(last?.text).not.toContain('\n');
     expect(last?.text).not.toContain('\\n');
-    expect(last?.text).toContain('Shell(');
+    expect(last?.text).toContain('Shell · Run script');
     expect(last?.text).toContain('python3');
   });
 
@@ -42,7 +41,7 @@ describe('state.reducer tool-call preview', () => {
     });
     const last = out.transcript[out.transcript.length - 1];
     // "shell " (6) + 120 + "…" (1) = 127 total. Loose check on the cap.
-    expect(last?.text.length).toBeLessThanOrEqual(140);
+    expect(last?.text.length).toBeLessThanOrEqual(150);
     expect(last?.text).toMatch(/…$/);
   });
 
@@ -128,6 +127,76 @@ describe('state.reducer tool-call preview', () => {
     expect(last?.prefix).toBe('⏺ ');
   });
 
+  it('uses a descriptive comment instead of env assignment for shell titles', () => {
+    const command = [
+      'TARGET="https://loyaltycoreapi-mazaya.dsquares.com"',
+      '# Map the entire /api/v2/loyalty/ tree by trying every plausible single-segment resource',
+      'for r in members cards rewards vouchers transactions offers balances tiers campaigns events notifications accounts profiles users customers merchants branches stores locations items products codes tokens sessions redemptions orders; do',
+      '  curl -sS -X GET "$TARGET/api/v2/loyalty/$r"',
+      'done',
+    ].join('\n');
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'shell',
+        args: {},
+        argsJSON: JSON.stringify({ command }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toBe(
+      [
+        'Shell · Map the entire /api/v2/loyalty/ tree by trying every plausible single-se…',
+        '$ TARGET="https://loyaltycoreapi-mazaya.dsquares.com" && for r in members cards rewards vouchers transactions offers balan…',
+      ].join('\n'),
+    );
+    expect(last?.text).not.toContain('Shell · Run TARGET');
+  });
+
+  it('uses the real command after leading env assignments for long one-liners', () => {
+    const command =
+      'TARGET="https://loyaltycoreapi-mazaya.dsquares.com" curl -sS -X GET "$TARGET/api/v2/loyalty/reward" -H "Accept: application/json" --max-time 10';
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'shell',
+        args: {},
+        argsJSON: JSON.stringify({ command }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toContain('Shell · HTTP request');
+    expect(last?.text).not.toContain('Run TARGET');
+  });
+
+  it.each([
+    ['mkdir -p recon/gobus.net && touch recon/gobus.net/notes.txt', 'Create directory'],
+    ['rg -n "Authorization" src README.md package.json '.repeat(4), 'Search files'],
+    ['find . -type f -name "*.ts" -maxdepth 4 '.repeat(4), 'Find files'],
+    ['jq -r ".items[].name" response.json '.repeat(5), 'Process text'],
+    ['python3 - <<PY\nprint("hello")\nPY', 'Run script'],
+    ['npm run test -- --runInBand '.repeat(5), 'Run package task'],
+    ['git status --short --branch && git diff --stat '.repeat(4), 'Git command'],
+  ])('renders long shell command "%s" as %s', (command, title) => {
+    const out = reducer(seed(), {
+      type: 'agent-event',
+      event: {
+        type: 'tool-call',
+        id: 'c1',
+        name: 'shell',
+        args: {},
+        argsJSON: JSON.stringify({ command }),
+      },
+    });
+    const last = out.transcript.at(-1);
+    expect(last?.text).toContain(`Shell · ${title}`);
+    expect(last?.text).toContain('\n$ ');
+  });
+
   it('renders confirmed findings with a red semantic label', () => {
     const out = reducer(seed(), {
       type: 'agent-event',
@@ -203,6 +272,17 @@ describe('state.reducer streaming / committed-live split', () => {
   const ev = (event: Parameters<typeof reducer>[1] extends { event: infer E } ? E : never) =>
     ({ type: 'agent-event', event }) as const;
 
+  it('records decision planner summaries as decision transcript entries', () => {
+    const out = reducer(
+      seed(),
+      ev({ type: 'decision', summary: 'decision planner: selected skill: recon' }),
+    );
+    expect(out.transcript.at(-1)).toMatchObject({
+      kind: 'decision',
+      text: 'decision planner: selected skill: recon',
+    });
+  });
+
   it('keeps a streaming assistant entry flagged until done finalizes it', () => {
     let s = reducer(seed(), ev({ type: 'assistant-delta', text: 'hel' }));
     s = reducer(s, ev({ type: 'assistant-delta', text: 'lo' }));
@@ -219,6 +299,21 @@ describe('state.reducer streaming / committed-live split', () => {
 });
 
 describe('state.reducer clear', () => {
+  it('cycles transcript filters in UI order', () => {
+    let s = seed();
+    expect(s.transcriptFilter).toBe('all');
+    s = reducer(s, { type: 'cycle-transcript-filter' });
+    expect(s.transcriptFilter).toBe('compact');
+    s = reducer(s, { type: 'cycle-transcript-filter' });
+    expect(s.transcriptFilter).toBe('findings');
+    s = reducer(s, { type: 'cycle-transcript-filter' });
+    expect(s.transcriptFilter).toBe('errors');
+    s = reducer(s, { type: 'cycle-transcript-filter' });
+    expect(s.transcriptFilter).toBe('current');
+    s = reducer(s, { type: 'cycle-transcript-filter' });
+    expect(s.transcriptFilter).toBe('all');
+  });
+
   it('empties the transcript and bumps clearGen to remount the log', () => {
     const withEntry = reducer(seed(), {
       type: 'append',

@@ -7,6 +7,7 @@ import { render } from 'ink-testing-library';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Agent } from '../agent/agent.js';
 import type { Client } from '../llm/client.js';
+import { listModels } from '../llm/models.js';
 import type { ChatResponse } from '../llm/types.js';
 import { AlwaysAllow } from '../permission/permission.js';
 import { newRegistry } from '../skills/registry.js';
@@ -23,6 +24,10 @@ vi.mock('../update/selfUpdate.js', () => ({
     installDir: '/tmp/bin',
     output: 'installed pentesterflow',
   })),
+}));
+
+vi.mock('../llm/models.js', () => ({
+  listModels: vi.fn(async () => ['qwen2.5-coder:14b', 'llama3.1:8b']),
 }));
 
 const stubClient: Client = {
@@ -94,6 +99,7 @@ beforeEach(() => {
   agent.run = runSpy as unknown as Agent['run'];
   setYolo = vi.fn();
   applyProvider = vi.fn(async () => {});
+  vi.mocked(listModels).mockClear();
 });
 
 afterEach(() => {
@@ -117,7 +123,7 @@ describe('UI slash commands (terminal integration)', () => {
     mounted.stdin.write('line one\nline two\nline three');
     await tick();
 
-    expect(mounted.lastFrame()).toContain('[Pasted text #1 +3 lines]');
+    expect(mounted.lastFrame()).toContain('[Pasted text #1 +3 lines, 28 chars]');
     expect(mounted.lastFrame()).not.toContain('line two');
 
     mounted.stdin.write('\r');
@@ -125,7 +131,7 @@ describe('UI slash commands (terminal integration)', () => {
 
     expect(runSpy).toHaveBeenCalledTimes(1);
     expect(runSpy.mock.calls[0][0]).toBe('line one\nline two\nline three');
-    expect(mounted.stdout.frames.join('')).toContain('[Pasted text #1 +3 lines]');
+    expect(mounted.stdout.frames.join('')).toContain('[Pasted text #1 +3 lines, 28 chars]');
   });
 
   it('/exit is handled as a command, not sent to the agent', async () => {
@@ -164,6 +170,63 @@ describe('UI slash commands (terminal integration)', () => {
     const frame = mounted.lastFrame() ?? '';
     expect(frame).toMatch(/backend|Ollama/i);
     expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it('/model list opens an interactive picker and switches on Enter', async () => {
+    mounted = renderApp();
+    await tick();
+    await submit(mounted.stdin, '/model list');
+    await tick();
+
+    expect(listModels).toHaveBeenCalledWith('ollama', '', '');
+    const frame = mounted.lastFrame() ?? '';
+    expect(frame).toContain('Select model for ollama');
+    expect(frame).toContain('stub-model');
+    expect(frame).toContain('qwen2.5-coder:14b');
+    expect(frame).toContain('current / used before');
+
+    mounted.stdin.write('\x1B[B');
+    await tick();
+    mounted.stdin.write('\r');
+    await tick();
+
+    expect(applyProvider).toHaveBeenCalledWith({
+      backend: 'ollama',
+      model: 'qwen2.5-coder:14b',
+      baseURL: '',
+      apiKey: '',
+    });
+    expect(mounted.lastFrame()).toContain('model set to qwen2.5-coder:14b');
+    expect(runSpy).not.toHaveBeenCalled();
+  });
+
+  it('/plan runs a plan-only turn with tools disabled', async () => {
+    mounted = renderApp();
+    await tick();
+    await submit(mounted.stdin, '/plan test gobus.net');
+    await tick();
+
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(runSpy.mock.calls[0][0]).toContain('Plan this objective');
+    expect(runSpy.mock.calls[0][0]).toContain('plan-only mode');
+    expect(runSpy.mock.calls[0][0]).toContain('ask concise clarifying questions');
+    expect(runSpy.mock.calls[0][0]).toContain('decision-complete implementation plan');
+    expect(runSpy.mock.calls[0][0]).toContain('test gobus.net');
+    expect(runSpy.mock.calls[0][0]).toContain('<proposed_plan>');
+    expect(runSpy.mock.calls[0][3]).toEqual({ tools: false });
+    expect(mounted.lastFrame()).toContain('/plan test gobus.net');
+    expect(mounted.lastFrame()).toContain('planning only');
+  });
+
+  it('/plan without args plans from current context', async () => {
+    mounted = renderApp();
+    await tick();
+    await submit(mounted.stdin, '/plan');
+    await tick();
+
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(runSpy.mock.calls[0][0]).toContain('current objective');
+    expect(runSpy.mock.calls[0][3]).toEqual({ tools: false });
   });
 
   it('/clear emits the clear-screen escape and is not sent to the agent', async () => {

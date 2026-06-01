@@ -32,6 +32,10 @@ export interface CompactEvent {
   type: 'compact';
   summary: string;
 }
+export interface DecisionEvent {
+  type: 'decision';
+  summary: string;
+}
 export interface SkillActiveEvent {
   type: 'skill-active';
   name: string;
@@ -47,6 +51,7 @@ export type AgentEvent =
   | ToolResultEvent
   | ErrorEvent
   | CompactEvent
+  | DecisionEvent
   | SkillActiveEvent
   | DoneEvent;
 

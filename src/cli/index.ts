@@ -20,6 +20,7 @@ import * as llmFactory from '../llm/factory.js';
 import { modelReliabilityWarning } from '../llm/modelWarnings.js';
 import { detectOllamaContextWindow, probeToolSupport } from '../llm/probe.js';
 import * as logger from '../logger/logger.js';
+import { createSessionDebugLog } from '../logger/sessionDebug.js';
 import { YoloPrompter } from '../permission/permission.js';
 import * as sessionStore from '../session/store.js';
 import { skillSearchDirs } from '../skills/discovery.js';
@@ -71,6 +72,8 @@ interface ParsedFlags {
   browserIngestPort: number;
   noStream: boolean;
   logPath: string;
+  debugSession: boolean;
+  debugSessionPath: string;
   listSkills: boolean;
   listTools: boolean;
 }
@@ -91,6 +94,8 @@ function parseFlags(argv: string[]): ParsedFlags {
     browserIngestPort: 9999,
     noStream: false,
     logPath: '',
+    debugSession: process.env.PENTESTERFLOW_DEBUG_SESSION === '1',
+    debugSessionPath: process.env.PENTESTERFLOW_DEBUG_SESSION_PATH ?? '',
     listSkills: false,
     listTools: false,
   };
@@ -152,6 +157,13 @@ function parseFlags(argv: string[]): ParsedFlags {
       }
       case '--log':
         out.logPath = next();
+        break;
+      case '--debug-session':
+        out.debugSession = true;
+        break;
+      case '--debug-session-path':
+        out.debugSession = true;
+        out.debugSessionPath = next();
         break;
       case '--list-skills':
         out.listSkills = true;
@@ -279,6 +291,23 @@ async function main(): Promise<number> {
     resuming = true;
   }
   const sessionStoreInstance = sessionStore.Store.newWithID(sessionDir, sessionID);
+  const sessionDebug = createSessionDebugLog({
+    enabled: flags.debugSession,
+    path: flags.debugSessionPath,
+    sessionID,
+  });
+  if (sessionDebug.enabled) {
+    sessionDebug.write('session_start', {
+      version: VERSION,
+      argv: process.argv.slice(2),
+      cwd: process.cwd(),
+      resume: resuming,
+      backend: cfg.backend,
+      model: cfg.model,
+      base_url: cfg.base_url,
+    });
+    process.stderr.write(`debug session log: ${sessionDebug.path}\n`);
+  }
 
   // Coverage tracking: which (endpoint, param, vuln_class) tuples the
   // agent has tried. Persists alongside findings so resumes keep state.
@@ -558,6 +587,7 @@ async function main(): Promise<number> {
         bindNoticePublisher: (publish) => {
           noticeHolder.publish = publish;
         },
+        sessionDebug,
         setYolo: (on: boolean) => prompter.setYolo(on),
         onSkillCreated,
         readConfig: () => ({
@@ -596,6 +626,7 @@ async function main(): Promise<number> {
   );
 
   await inkApp.waitUntilExit();
+  sessionDebug.write('session_exit');
   // Trip the root abort signal before tearing down MCP sessions and the
   // ingest server. The TUI's own Ctrl-C path aborts the per-run signal
   // (runCtl) and then calls exit(), but never the root signal — so any
@@ -703,10 +734,12 @@ Flags:
   --dangerously-skip-permissions   YOLO mode
   --list-skills / --list-tools
   --log <path>
+  --debug-session           write a complete JSONL session debug log
+  --debug-session-path <p>  custom path for --debug-session
   --version / --help
 
 In the TUI: Enter send · Esc cancel turn · Ctrl-C quit · mouse-wheel scroll
-Slash: /help /clear /reset /exit /target /maxsteps /thinking /update
+Slash: /help /plan /clear /reset /exit /target /maxsteps /thinking /update
 `);
 }
 

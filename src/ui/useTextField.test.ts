@@ -101,13 +101,13 @@ describe('pasted text markers', () => {
     expect(shouldCollapsePaste('line 1\nline 2')).toBe(true);
   });
 
-  it('builds a compact marker with the paste id and line count', () => {
-    expect(pastedTextMarker(1, 'one\ntwo\nthree')).toBe('[Pasted text #1 +3 lines]');
+  it('builds a compact marker with paste id, line count, and character count', () => {
+    expect(pastedTextMarker(1, 'one\ntwo\nthree')).toBe('[Pasted text #1 +3 lines, 13 chars]');
   });
 
   it('expands pasted text markers before submission', () => {
     const pasted = new Map([[1, 'alpha\nbeta']]);
-    expect(expandPastedTextMarkers('review [Pasted text #1 +2 lines]', pasted)).toBe(
+    expect(expandPastedTextMarkers('review [Pasted text #1 +2 lines, 10 chars]', pasted)).toBe(
       'review alpha\nbeta',
     );
   });

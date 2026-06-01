@@ -15,6 +15,7 @@ import { type Registry as SkillRegistry, materializeSkillBody } from '../skills/
 import type { Target } from '../target/target.js';
 import { canonicalToolName } from '../tools/aliases.js';
 import type { Registry as ToolRegistry } from '../tools/registry.js';
+import { buildDecisionPlan } from './decisionPlanner.js';
 import type { AgentEvent } from './events.js';
 import { MaxStepsError } from './events.js';
 import { expandFileMentions } from './mentions.js';
@@ -22,6 +23,11 @@ import { stripThinkingTags } from './sanitize.js';
 import { type ToolingProfile, buildSystemPrompt } from './systemPrompt.js';
 
 export type EventSink = (e: AgentEvent) => void;
+
+export interface AgentRunOptions {
+  /** When false, omit tool definitions and block any tool calls returned anyway. */
+  tools?: boolean;
+}
 
 export interface AgentOptions {
   client: Client;
@@ -330,11 +336,16 @@ export class Agent {
 
   // ---------- main loop ----------
 
-  async run(userMsg: string, signal: AbortSignal, emit: EventSink): Promise<void> {
+  async run(
+    userMsg: string,
+    signal: AbortSignal,
+    emit: EventSink,
+    opts?: AgentRunOptions,
+  ): Promise<void> {
     const safeEmit = makeSafeEmit(signal, emit);
     this.running = true;
     try {
-      await this.runInner(userMsg, signal, safeEmit);
+      await this.runInner(userMsg, signal, safeEmit, opts);
     } catch (err) {
       if (signal.aborted || isAbortLikeError(err)) {
         safeEmit({ type: 'error', err: new Error('turn cancelled') });
@@ -397,7 +408,12 @@ export class Agent {
     }
   }
 
-  private async runInner(userMsg: string, signal: AbortSignal, emit: EventSink): Promise<void> {
+  private async runInner(
+    userMsg: string,
+    signal: AbortSignal,
+    emit: EventSink,
+    opts?: AgentRunOptions,
+  ): Promise<void> {
     // Auto-compact gate. Run BEFORE we add the new user message so the
     // compaction summary doesn't include this turn's question — the
     // user expects their prompt to be answered, not summarized away.
@@ -411,6 +427,19 @@ export class Agent {
       await this.autoCompact(signal, emit);
     }
 
+    const decision =
+      opts?.tools === false
+        ? undefined
+        : buildDecisionPlan(userMsg, this.skills.listEnabled(), this.target);
+    if (decision) {
+      if (decision.recommendedSkill) {
+        emit({
+          type: 'decision',
+          summary: `decision planner: selected skill: ${decision.recommendedSkill} · risk: ${decision.risk} · ${decision.reason}`,
+        });
+      }
+    }
+
     // Persist the raw user message (un-expanded mentions) so the on-disk
     // session doesn't leak file contents the user inlined via @path.
     this.history.push({ role: 'user', content: userMsg });
@@ -420,6 +449,9 @@ export class Agent {
     );
 
     const last = working[working.length - 1];
+    if (decision && last) {
+      working.splice(working.length - 1, 0, { role: 'system', content: decision.guidance });
+    }
     if (last) last.content = expandFileMentions(userMsg);
 
     const maxSteps = this.maxSteps;
@@ -429,10 +461,20 @@ export class Agent {
       const req: ChatRequest = {
         model: this.client.model(),
         messages: working,
-        tools: this.tools.asLLMTools(),
       };
+      if (opts?.tools !== false) req.tools = this.tools.asLLMTools();
       const { resp, streamed } = await this.chat(req, signal, emit);
       resp.message.content = stripThinkingTags(resp.message.content);
+      const toolCalls = resp.message.toolCalls ?? [];
+      const hasToolCalls = toolCalls.length > 0;
+
+      if (opts?.tools === false && hasToolCalls) {
+        if (resp.message.content && !streamed) {
+          emit({ type: 'assistant-text', text: resp.message.content });
+        }
+        emit({ type: 'error', err: new Error('plan-only mode blocked tool calls') });
+        return;
+      }
 
       this.history.push(resp.message);
       working.push(resp.message);
@@ -443,11 +485,11 @@ export class Agent {
       if (resp.message.content && !streamed) {
         emit({ type: 'assistant-text', text: resp.message.content });
       }
-      if (!resp.message.toolCalls || resp.message.toolCalls.length === 0) {
+      if (!hasToolCalls) {
         return;
       }
 
-      for (const tc of resp.message.toolCalls) {
+      for (const tc of toolCalls) {
         if (signal.aborted) throw new Error('aborted');
         let args: Record<string, unknown> = {};
         let parseErr: Error | undefined;

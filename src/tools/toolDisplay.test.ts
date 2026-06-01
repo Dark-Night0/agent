@@ -17,6 +17,10 @@ describe('displayToolName', () => {
   it('maps ask_user to "Ask User"', () => {
     expect(displayToolName('ask_user')).toBe('Ask User');
   });
+  it('maps web tools to title-case labels', () => {
+    expect(displayToolName('web_fetch')).toBe('Web Fetch');
+    expect(displayToolName('web_search')).toBe('Web Search');
+  });
   it('passes unknown tools through unchanged', () => {
     expect(displayToolName('shell')).toBe('shell');
     expect(displayToolName('not_real')).toBe('not_real');

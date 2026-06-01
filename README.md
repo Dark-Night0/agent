@@ -77,6 +77,7 @@ step is visible, reproducible, and easy to audit.
 - **Local by default**: run against your own model backend with no required cloud account.
 - **Modern terminal UI**: compact tool calls, readable shell transcripts, skill summaries, and finding-focused output.
 - **Permission-aware execution**: approve each risky action once or for the session.
+- **Decision planner**: each normal turn gets lightweight skill selection, risk labeling, and coverage guidance before tool use.
 - **Verified findings only**: the agent should reproduce a bug before using `confirm_finding`.
 - **Portable shell guidance**: tool prompts and preflight checks steer commands away from GNU-only flags when they can break on macOS or Linux.
 - **Extensible workflows**: add custom skills, MCP servers, and browser-capture producers.
@@ -165,6 +166,8 @@ pentesterflow --dangerously-skip-permissions
 | `--dangerously-skip-permissions` | Auto-approve non-sensitive tool calls. |
 | `--list-tools` / `--list-skills` | Print registered tools or discovered skills. |
 | `--log <path>` | Override the JSON-lines log path. |
+| `--debug-session` | Write a complete JSON-lines debug log for the interactive session. |
+| `--debug-session-path <path>` | Write the debug session log to a custom path. |
 | `--version` / `--help` | Print version or help. |
 
 ### Slash Commands
@@ -173,7 +176,8 @@ pentesterflow --dangerously-skip-permissions
 |---|---|
 | `/help` | Show keybindings and command reference. |
 | `/provider` | Pick a backend and model interactively. |
-| `/model <id>` | Switch model. |
+| `/model <id>` / `/model list` | Switch model or list available backend models. |
+| `/plan [objective]` | Start a plan-only turn without tool execution. |
 | `/target <url>` | Set or clear the engagement base URL. |
 | `/skills [enable\|disable\|new <name>]` | Manage skills or scaffold a new skill. |
 | `/maxsteps <n>` | Set the per-turn tool-call cap. |
@@ -188,7 +192,7 @@ pentesterflow --dangerously-skip-permissions
 ## How It Works
 
 1. **Scope**: set a target and constraints before testing.
-2. **Plan**: select the relevant methodology or load a skill playbook.
+2. **Plan**: select the relevant methodology, risk level, and skill playbook.
 3. **Act**: call approved tools such as `http`, `shell`, file tools, browser capture, or MCP servers.
 4. **Observe**: compare responses, status codes, headers, timing, and account boundaries.
 5. **Verify**: reproduce the issue with a clean command or request.
@@ -269,6 +273,19 @@ server for compatible clients.
 | `./.pentesterflow/skills/<name>/SKILL.md` | Project-local skills. |
 | `./findings/<slug>.md` | Confirmed findings for the current engagement. |
 | `~/.pentesterflow/logs/pentesterflow.log` | Structured JSON-lines logs. |
+| `~/.pentesterflow/debug/session-*.jsonl` | Opt-in complete session debug logs from `--debug-session`. |
+
+Enable a complete debug log when reproducing usage issues:
+
+```sh
+pentesterflow --debug-session
+PENTESTERFLOW_DEBUG_SESSION=1 pentesterflow
+PENTESTERFLOW_DEBUG_SESSION=1 PENTESTERFLOW_DEBUG_SESSION_PATH=/tmp/pf-debug.jsonl pentesterflow
+```
+
+Debug session logs include prompts, assistant events, tool calls, tool results,
+errors, and shutdown markers. Treat them as sensitive because they can contain
+target data, command output, and copied request material.
 
 ## Develop
 

@@ -25,6 +25,7 @@ describe('filterSlash', () => {
         .map((s) => s.name)
         .sort(),
     ).toEqual(['/maxsteps', '/model']);
+    expect(filterSlash('/pl').map((s) => s.name)).toEqual(['/plan']);
   });
 
   it('includes /provider in the catalog', () => {

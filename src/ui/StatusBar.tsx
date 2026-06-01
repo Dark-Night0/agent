@@ -4,6 +4,7 @@
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
 import type { ToolSupportPill } from './Banner.js';
+import type { TranscriptFilter, UiPhase } from './state.js';
 
 export interface StatusProps {
   busy: boolean;
@@ -15,6 +16,9 @@ export interface StatusProps {
    *  once into scrollback) can't reflect post-launch changes. */
   model?: string;
   toolSupport?: ToolSupportPill;
+  phase: UiPhase;
+  transcriptFilter: TranscriptFilter;
+  target?: string;
   /** True when a collapsible tool-result hasn't been expanded yet (Ctrl-O reprints it). */
   expandHint: boolean;
 }
@@ -33,13 +37,14 @@ function toolPill(t?: ToolSupportPill): { text: string; color: string } | null {
 }
 
 export function StatusBar(props: StatusProps): React.ReactElement {
+  const phaseText = phaseLabel(props.phase);
   if (props.busy) {
     return (
       <Box>
         <Text color="yellow">
           <Spinner type="dots" />
         </Text>
-        <Text color="gray"> thinking · Esc to cancel</Text>
+        <Text color="gray"> {phaseText} · Esc to cancel</Text>
         {props.activeSkill ? <Text color="gray"> · skill: {props.activeSkill}</Text> : null}
       </Box>
     );
@@ -64,10 +69,14 @@ export function StatusBar(props: StatusProps): React.ReactElement {
           disconnected
         </Text>
       )}
-      <Text color="gray"> · Enter send · / commands</Text>
+      <Text color="gray"> · {phaseText} · Enter send · / commands</Text>
       {props.model ? <Text color="gray"> · {props.model}</Text> : null}
+      {props.target ? <Text color="gray"> · target: {compactTarget(props.target)}</Text> : null}
       {pill ? <Text color={pill.color}> [{pill.text}]</Text> : null}
       {props.expandHint ? <Text color="cyan"> · Ctrl-O expand output</Text> : null}
+      {props.transcriptFilter !== 'all' ? (
+        <Text color="cyan"> · filter: {props.transcriptFilter}</Text>
+      ) : null}
       {props.activeSkill ? <Text color="gray"> · skill: {props.activeSkill}</Text> : null}
       {ctxHint ? <Text color="gray">{ctxHint}</Text> : null}
       {props.yolo ? (
@@ -77,4 +86,27 @@ export function StatusBar(props: StatusProps): React.ReactElement {
       ) : null}
     </Box>
   );
+}
+
+function phaseLabel(phase: UiPhase): string {
+  switch (phase) {
+    case 'planning':
+      return 'planning';
+    case 'running-tool':
+      return 'running tool';
+    case 'answering':
+      return 'answering';
+    case 'waiting-approval':
+      return 'waiting approval';
+    case 'waiting-user':
+      return 'waiting input';
+    case 'skills':
+      return 'skills';
+    case 'idle':
+      return 'idle';
+  }
+}
+
+function compactTarget(target: string): string {
+  return target.replace(/^https?:\/\//, '').replace(/\/$/, '');
 }

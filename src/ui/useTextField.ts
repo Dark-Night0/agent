@@ -193,11 +193,12 @@ export function shouldCollapsePaste(s: string): boolean {
 }
 
 export function pastedTextMarker(id: number, text: string): string {
-  const lineCount = normalizePastedText(text).split('\n').length;
-  return `[Pasted text #${id} +${lineCount} lines]`;
+  const normalized = normalizePastedText(text);
+  const lineCount = normalized.split('\n').length;
+  return `[Pasted text #${id} +${lineCount} lines, ${normalized.length} chars]`;
 }
 
-const PASTED_TEXT_MARKER_RE = /\[Pasted text #(\d+) \+\d+ lines\]/g;
+const PASTED_TEXT_MARKER_RE = /\[Pasted text #(\d+) \+\d+ lines(?:, \d+ chars)?\]/g;
 
 export function expandPastedTextMarkers(
   value: string,

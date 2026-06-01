@@ -7,11 +7,12 @@ import { join, resolve } from 'node:path';
 import { Chalk } from 'chalk';
 import { Box, useApp, useInput, useStdout } from 'ink';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import type { Agent } from '../agent/agent.js';
+import type { Agent, AgentRunOptions } from '../agent/agent.js';
 import { type AgentEvent, MaxStepsError } from '../agent/events.js';
 import { findActiveMention, listMentionDir, parseMentionPath } from '../agent/mentions.js';
 import type { Backend } from '../config/config.js';
 import { listModels } from '../llm/models.js';
+import type { SessionDebugLog } from '../logger/sessionDebug.js';
 import { renderSkillTemplate } from '../skills/template.js';
 import { runSelfUpdate } from '../update/selfUpdate.js';
 import { AskModal } from './AskModal.js';
@@ -26,7 +27,7 @@ import { useTerminalSize } from './TerminalSize.js';
 import { EntryView, Transcript } from './Transcript.js';
 import type { AskRequest } from './askBridge.js';
 import { SLASH_ITEMS, filterSlash } from './slashItems.js';
-import type { Action } from './state.js';
+import type { Action, TranscriptEntry, TranscriptFilter } from './state.js';
 import { initialState, reducer } from './state.js';
 import { usePing } from './usePing.js';
 import {
@@ -81,6 +82,8 @@ export interface AppProps {
   bindBannerPublisher?: (publish: (patch: Partial<BannerData>) => void) => void;
   /** Persist /skills enable/disable to ~/.pentesterflow/config.json. */
   persistDisabledSkills?: PersistDisabledSkills;
+  /** Optional complete JSONL debug log for real-world session triage. */
+  sessionDebug?: SessionDebugLog;
   /** Notify the CLI that `/skills new` created a skill under this root dir,
    *  so it can start watching it for hot-reload. */
   onSkillCreated?: (skillRootDir: string) => void;
@@ -101,6 +104,7 @@ export function App({
   setYolo,
   bindBannerPublisher,
   persistDisabledSkills,
+  sessionDebug,
   onSkillCreated,
   bindNoticePublisher,
 }: AppProps): JSX.Element {
@@ -153,7 +157,15 @@ export function App({
   }, []);
 
   const runAgentTurn = useCallback(
-    (value: string, opts?: { transcriptUserText?: string; systemText?: string }) => {
+    (
+      value: string,
+      opts?: { transcriptUserText?: string; systemText?: string; runOptions?: AgentRunOptions },
+    ) => {
+      sessionDebug?.write('turn_start', {
+        prompt: value,
+        transcript_user_text: opts?.transcriptUserText,
+        system_text: opts?.systemText,
+      });
       if (opts?.transcriptUserText) {
         dispatch({ type: 'append', entry: { kind: 'user', text: opts.transcriptUserText } });
       }
@@ -166,6 +178,7 @@ export function App({
       runCtl.current = ctl;
 
       const handleEvent = (ev: AgentEvent) => {
+        sessionDebug?.agentEvent(ev);
         if (ev.type === 'error' && isMaxStepsError(ev.err)) {
           const steps = ev.err.steps;
           dispatch({
@@ -219,14 +232,20 @@ export function App({
         dispatch({ type: 'agent-event', event: ev });
       };
 
-      void agent.run(value, ctl.signal, handleEvent).catch((err: unknown) => {
+      void agent.run(value, ctl.signal, handleEvent, opts?.runOptions).catch((err: unknown) => {
+        sessionDebug?.write('run_error', {
+          err:
+            err instanceof Error
+              ? { name: err.name, message: err.message, stack: err.stack }
+              : String(err),
+        });
         dispatch({
           type: 'append',
           entry: { kind: 'error', text: err instanceof Error ? err.message : String(err) },
         });
       });
     },
-    [agent, isMaxStepsError],
+    [agent, isMaxStepsError, sessionDebug],
   );
 
   // Bridge publishers wired exactly once so prompts surface as modals.
@@ -343,6 +362,7 @@ export function App({
           applyProvider,
           persistDisabledSkills,
           onSkillCreated,
+          runAgentTurn,
         );
         if (handled) return;
       }
@@ -387,6 +407,10 @@ export function App({
     //    collapsible.
     if (key.ctrl && rawInput === 'o') {
       dispatch({ type: 'expand-tool-output' });
+      return;
+    }
+    if (key.ctrl && rawInput === 'f') {
+      dispatch({ type: 'cycle-transcript-filter' });
       return;
     }
 
@@ -605,11 +629,20 @@ export function App({
     return last && last.kind === 'assistant' && last.streaming ? last : null;
   })();
   const committed = liveEntry ? state.transcript.slice(0, -1) : state.transcript;
+  const filteredCommitted = filterTranscript(committed, state.transcriptFilter);
+  const showLiveEntry = liveEntry
+    ? transcriptEntryMatchesFilter(liveEntry, state.transcriptFilter)
+    : false;
+  const target = agent.target.baseURL() || agent.target.name();
 
   return (
     <Box flexDirection="column" width={cols}>
-      <Transcript committed={committed} bannerData={bannerSnapshot} generation={state.clearGen} />
-      {liveEntry ? (
+      <Transcript
+        committed={filteredCommitted}
+        bannerData={bannerSnapshot}
+        generation={`${state.clearGen}:${state.transcriptFilter}`}
+      />
+      {liveEntry && showLiveEntry ? (
         <Box flexDirection="column">
           <EntryView entry={liveEntry} />
         </Box>
@@ -644,6 +677,9 @@ export function App({
             ctxTokens={agent.approxTokens()}
             model={state.bannerData.model}
             toolSupport={state.bannerData.toolSupport}
+            phase={state.phase}
+            transcriptFilter={state.transcriptFilter}
+            target={target}
             expandHint={state.transcript.some((e) => e.collapsible && !e.expanded)}
           />
         </>
@@ -669,6 +705,30 @@ function cursorIsOnLastLine(value: string, cursor: number): boolean {
   return value.indexOf('\n', cursor) === -1;
 }
 
+function filterTranscript(entries: TranscriptEntry[], filter: TranscriptFilter): TranscriptEntry[] {
+  if (filter === 'all') return entries;
+  if (filter === 'current') {
+    const lastUserIdx = entries.findLastIndex((entry) => entry.kind === 'user');
+    return lastUserIdx === -1 ? entries : entries.slice(lastUserIdx);
+  }
+  return entries.filter((entry) => transcriptEntryMatchesFilter(entry, filter));
+}
+
+function transcriptEntryMatchesFilter(entry: TranscriptEntry, filter: TranscriptFilter): boolean {
+  switch (filter) {
+    case 'all':
+    case 'current':
+      return true;
+    case 'compact':
+      if (entry.kind === 'tool-result' && entry.text.startsWith('[ok]')) return false;
+      return entry.kind !== 'decision';
+    case 'findings':
+      return entry.kind === 'finding' || entry.text.includes('Confirmed Finding');
+    case 'errors':
+      return entry.kind === 'error' || entry.text.includes('[error]');
+  }
+}
+
 // ---------- slash command dispatcher ----------
 
 function handleSlash(
@@ -683,6 +743,10 @@ function handleSlash(
   applyProvider: ApplyProvider,
   persistDisabledSkills: PersistDisabledSkills | undefined,
   onSkillCreated: ((skillRootDir: string) => void) | undefined,
+  runAgentTurn: (
+    value: string,
+    opts?: { transcriptUserText?: string; systemText?: string; runOptions?: AgentRunOptions },
+  ) => void,
 ): boolean {
   const [cmd, ...rest] = raw.trim().split(/\s+/);
   switch (cmd) {
@@ -723,6 +787,16 @@ function handleSlash(
         entry: { kind: 'system', text: buildHelpText(agent, readConfig) },
       });
       return true;
+    case '/plan': {
+      const objective = rest.join(' ').trim();
+      const prompt = buildPlanPrompt(objective);
+      runAgentTurn(prompt, {
+        transcriptUserText: objective ? `/plan ${objective}` : '/plan',
+        systemText: 'planning only — tools disabled',
+        runOptions: { tools: false },
+      });
+      return true;
+    }
     case '/provider':
       openProviderPicker(dispatch, readConfig, applyProvider);
       return true;
@@ -734,12 +808,19 @@ function handleSlash(
           type: 'append',
           entry: {
             kind: 'system',
-            text: `current model: ${cur.model || '(unset)'}\nusage: /model <id>  ·  or run /provider for an interactive picker`,
+            text: `current model: ${cur.model || '(unset)'}\nusage: /model <id>  ·  /model list  ·  or run /provider for an interactive picker`,
           },
         });
         return true;
       }
       const cur = readConfig();
+      if (m.toLowerCase() === 'list' || m.toLowerCase() === 'ls') {
+        void fetchAndPickModel(cur.backend, cur.baseURL, cur.apiKey, dispatch, applyProvider, {
+          currentModel: cur.model || agent.client.model(),
+          successText: (picked) => `model set to ${picked}`,
+        });
+        return true;
+      }
       // Validate the id against the live backend catalog before swapping
       // the client. A typo here used to persist into config.json and the
       // agent would fail on the next chat with a confusing 404; now the
@@ -881,6 +962,33 @@ function handleSlash(
       return false;
     }
   }
+}
+
+function backendLabel(backend: Backend): string {
+  return backend === '' ? 'ollama' : backend;
+}
+
+function buildPlanPrompt(objective: string): string {
+  const subject = objective
+    ? `Plan this objective:\n\n${objective}`
+    : 'Create a plan for the current objective using the existing conversation context.';
+  return `${subject}
+
+You are in plan-only mode for this turn.
+
+Rules:
+- Do not call tools, run commands, fetch URLs, scan targets, or modify files.
+- Reason from the conversation context and the user's objective only.
+- If important product, scope, safety, or implementation details are missing, ask concise clarifying questions instead of inventing details.
+- If the intent is clear enough, produce a decision-complete implementation plan that another engineer or agent can execute without making major choices.
+- Keep the plan concise and practical.
+
+When you are ready to finalize, return the plan wrapped exactly in:
+<proposed_plan>
+...
+</proposed_plan>
+
+Use Markdown inside the block. Prefer these sections: Summary, Key Changes, Test Plan, Assumptions.`;
 }
 
 /**
@@ -1062,7 +1170,7 @@ const TIPS: string[] = [
   'coverage(action="untested", candidates=[...], vuln_classes=[...]) returns the (endpoint, param, class) tuples you have NOT tested yet — drive the next pass off of it.',
   'read_payloads(skill="<name>") pulls curated wordlists from disk. Skills like ssti / jwt ship pre-canned payload files in their payloads/ directory.',
   "Disabled skills are hidden from the agent's system prompt entirely. Use /skills to flip a skill back on without restarting.",
-  '/model <id> validates against the live backend catalog and suggests the closest match on typo. /provider for the full interactive picker.',
+  '/model list opens an interactive backend model picker; /model <id> validates against the live catalog and suggests the closest match on typo.',
 ];
 
 function pad(s: string, n: number): string {
@@ -1237,6 +1345,10 @@ async function fetchAndPickModel(
   apiKey: string,
   dispatch: React.Dispatch<Action>,
   applyProvider: ApplyProvider,
+  opts?: {
+    currentModel?: string;
+    successText?: (picked: string) => string;
+  },
 ): Promise<void> {
   let models: string[];
   try {
@@ -1251,23 +1363,29 @@ async function fetchAndPickModel(
     });
     return;
   }
-  if (models.length === 0) {
+  const currentModel = opts?.currentModel;
+  const allModels =
+    currentModel && !models.includes(currentModel) ? [currentModel, ...models] : models;
+  if (allModels.length === 0) {
     dispatch({
       type: 'append',
       entry: {
         kind: 'error',
-        text: `${backend} returned no models — is it running with a model loaded?`,
+        text: `${backendLabel(backend)} returned no models — is it running with a model loaded?`,
       },
     });
     return;
   }
-  const shown = models.slice(0, MODEL_PICKER_CAP);
-  const overflow = models.length - shown.length;
+  const shown = allModels.slice(0, MODEL_PICKER_CAP);
+  const overflow = allModels.length - shown.length;
   const req: AskRequest = {
     question: {
       header: 'model',
-      question: `Select model for ${backend}${overflow > 0 ? `  (showing ${shown.length} of ${models.length} — use /model <id> for unlisted)` : ''}:`,
-      options: shown.map((m) => ({ label: m })),
+      question: `Select model for ${backendLabel(backend)}${overflow > 0 ? `  (showing ${shown.length} of ${allModels.length} — use /model <id> for unlisted)` : ''}:`,
+      options: shown.map((m) => ({
+        label: m,
+        description: currentModel && m === currentModel ? 'current / used before' : undefined,
+      })),
     },
     resolve: (picked) => {
       dispatch({ type: 'set-ask', req: null });
@@ -1275,7 +1393,10 @@ async function fetchAndPickModel(
         .then(() =>
           dispatch({
             type: 'append',
-            entry: { kind: 'system', text: `provider set to ${backend} · model ${picked}` },
+            entry: {
+              kind: 'system',
+              text: opts?.successText?.(picked) ?? `provider set to ${backend} · model ${picked}`,
+            },
           }),
         )
         .catch((err: unknown) =>

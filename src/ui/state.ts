@@ -10,7 +10,15 @@ import type { PermissionRequest } from './permBridge.js';
 import { buildToolResultView } from './toolResultFormat.js';
 
 export interface TranscriptEntry {
-  kind: 'user' | 'assistant' | 'tool-call' | 'tool-result' | 'system' | 'error' | 'finding';
+  kind:
+    | 'user'
+    | 'assistant'
+    | 'tool-call'
+    | 'tool-result'
+    | 'system'
+    | 'error'
+    | 'finding'
+    | 'decision';
   text: string;
   /** Set on streaming assistant text so deltas can append in place. While
    *  true and at the tail, this entry renders in the live frame rather
@@ -29,6 +37,17 @@ export interface TranscriptEntry {
   color?: string;
 }
 
+export type UiPhase =
+  | 'idle'
+  | 'planning'
+  | 'running-tool'
+  | 'answering'
+  | 'waiting-approval'
+  | 'waiting-user'
+  | 'skills';
+
+export type TranscriptFilter = 'all' | 'compact' | 'findings' | 'errors' | 'current';
+
 export interface AppState {
   banner: string;
   bannerData: BannerData;
@@ -46,6 +65,8 @@ export interface AppState {
    *  snapshot in this slot — a boolean is enough. */
   pendingSkills: boolean;
   yolo: boolean;
+  phase: UiPhase;
+  transcriptFilter: TranscriptFilter;
 }
 
 export function initialState(banner: string, bannerData: BannerData): AppState {
@@ -61,6 +82,8 @@ export function initialState(banner: string, bannerData: BannerData): AppState {
     pendingAsk: null,
     pendingSkills: false,
     yolo: false,
+    phase: 'idle',
+    transcriptFilter: 'all',
   };
 }
 
@@ -76,6 +99,7 @@ export type Action =
   | { type: 'set-perm'; req: PermissionRequest | null }
   | { type: 'set-ask'; req: AskRequest | null }
   | { type: 'set-skills-picker'; open: boolean }
+  | { type: 'cycle-transcript-filter' }
   | { type: 'expand-tool-output' }
   | { type: 'clear' }
   | { type: 'agent-event'; event: AgentEvent };
@@ -106,7 +130,7 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
     case 'set-busy':
-      return { ...state, busy: action.busy };
+      return { ...state, busy: action.busy, phase: action.busy ? 'planning' : 'idle' };
     case 'set-api-ready':
       return { ...state, apiReady: action.ready };
     case 'set-active-skill':
@@ -114,11 +138,21 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'set-yolo':
       return { ...state, yolo: action.on };
     case 'set-perm':
-      return { ...state, pendingPerm: action.req };
+      return {
+        ...state,
+        pendingPerm: action.req,
+        phase: action.req ? 'waiting-approval' : state.busy ? 'running-tool' : 'idle',
+      };
     case 'set-ask':
-      return { ...state, pendingAsk: action.req };
+      return {
+        ...state,
+        pendingAsk: action.req,
+        phase: action.req ? 'waiting-user' : state.busy ? 'answering' : 'idle',
+      };
     case 'set-skills-picker':
-      return { ...state, pendingSkills: action.open };
+      return { ...state, pendingSkills: action.open, phase: action.open ? 'skills' : 'idle' };
+    case 'cycle-transcript-filter':
+      return { ...state, transcriptFilter: nextTranscriptFilter(state.transcriptFilter) };
     case 'expand-tool-output': {
       // Reprint the most recent not-yet-expanded collapsible tool-result's
       // full body as a NEW log entry. Committed scrollback can't be toggled
@@ -154,6 +188,13 @@ export function reducer(state: AppState, action: Action): AppState {
       return state;
     }
   }
+}
+
+const TRANSCRIPT_FILTERS: TranscriptFilter[] = ['all', 'compact', 'findings', 'errors', 'current'];
+
+function nextTranscriptFilter(current: TranscriptFilter): TranscriptFilter {
+  const idx = TRANSCRIPT_FILTERS.indexOf(current);
+  return TRANSCRIPT_FILTERS[(idx + 1) % TRANSCRIPT_FILTERS.length] ?? 'all';
 }
 
 const TOOL_CALL_PREVIEW_CAP = 120;
@@ -225,44 +266,114 @@ function cleanShellComment(line: string): string {
     .trim();
 }
 
+function isShellAssignment(line: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(line);
+}
+
 function shellActionFromCommand(command: string): { title: string; command: string } | null {
   const lines = command
     .replace(/\r\n/g, '\n')
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
-  const first = lines[0] ?? '';
-  if (!first.startsWith('#')) return null;
+  const commentIdx = lines.findIndex((line) => line.startsWith('#'));
+  if (commentIdx === -1) return null;
+  if (commentIdx > 0 && lines.slice(0, commentIdx).some((line) => !isShellAssignment(line))) {
+    return null;
+  }
+
+  const comment = lines[commentIdx] ?? '';
+  const runnable = lines.filter((line) => !line.startsWith('#'));
 
   if (lines.length > 1) {
     return {
-      title: capText(cleanShellComment(first), SHELL_TITLE_CAP),
-      command: previewArgs(lines.slice(1).join(' && ')),
+      title: capText(cleanShellComment(comment), SHELL_TITLE_CAP),
+      command: previewArgs(runnable.join(' && ')),
     };
   }
 
-  const curlIdx = first.indexOf(' curl ');
+  const curlIdx = comment.indexOf(' curl ');
   if (curlIdx !== -1) {
     return {
-      title: capText(cleanShellComment(first.slice(0, curlIdx)), SHELL_TITLE_CAP),
-      command: previewArgs(first.slice(curlIdx + 1)),
+      title: capText(cleanShellComment(comment.slice(0, curlIdx)), SHELL_TITLE_CAP),
+      command: previewArgs(comment.slice(curlIdx + 1)),
     };
   }
 
   return {
-    title: capText(cleanShellComment(first), SHELL_TITLE_CAP),
+    title: capText(cleanShellComment(comment), SHELL_TITLE_CAP),
     command: previewArgs(command),
   };
 }
 
 function shellLongCommandBlock(command: string): { title: string; command: string } | null {
   const preview = previewArgs(command);
-  if (preview.length < SHELL_BLOCK_COMMAND_THRESHOLD && !preview.endsWith('…')) return null;
+  const isStructured =
+    command.includes('\n') ||
+    command.includes(' && ') ||
+    command.includes(' || ') ||
+    command.includes(';');
+  if (preview.length < SHELL_BLOCK_COMMAND_THRESHOLD && !preview.endsWith('…') && !isStructured) {
+    return null;
+  }
 
-  const firstWord = preview.match(/^[A-Za-z0-9_.:/-]+/)?.[0] ?? 'command';
-  const title =
-    firstWord === 'curl' ? 'HTTP request' : firstWord === 'for' ? 'Run loop' : `Run ${firstWord}`;
-  return { title, command: preview };
+  return { title: shellTitleFromPreview(preview), command: preview };
+}
+
+function shellTitleFromPreview(preview: string): string {
+  const firstWord = firstShellWord(preview);
+  switch (firstWord) {
+    case 'curl':
+    case 'http':
+    case 'wget':
+      return 'HTTP request';
+    case 'for':
+    case 'while':
+    case 'until':
+      return 'Run loop';
+    case 'mkdir':
+      return 'Create directory';
+    case 'grep':
+    case 'rg':
+      return 'Search files';
+    case 'find':
+      return 'Find files';
+    case 'cat':
+    case 'head':
+    case 'tail':
+      return 'Read output';
+    case 'awk':
+    case 'jq':
+    case 'sed':
+      return 'Process text';
+    case 'python':
+    case 'python3':
+    case 'node':
+    case 'tsx':
+      return 'Run script';
+    case 'npm':
+    case 'pnpm':
+    case 'yarn':
+    case 'bun':
+      return 'Run package task';
+    case 'git':
+      return 'Git command';
+    case 'openssl':
+      return 'OpenSSL';
+    case 'echo':
+    case 'printf':
+      return 'Print text';
+    default:
+      return `Run ${firstWord}`;
+  }
+}
+
+function firstShellWord(preview: string): string {
+  const withoutAssignments = preview.replace(
+    /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+)\s+)+/,
+    '',
+  );
+  return withoutAssignments.match(/^[A-Za-z0-9_.:/-]+/)?.[0] ?? 'command';
 }
 
 function formatToolCallText(name: string, argsJSON: string): string {
@@ -292,10 +403,15 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.kind === 'assistant' && last.streaming) {
         const finalized: TranscriptEntry = { ...last, streaming: false };
-        return { ...state, transcript: [...state.transcript.slice(0, -1), finalized] };
+        return {
+          ...state,
+          phase: 'answering',
+          transcript: [...state.transcript.slice(0, -1), finalized],
+        };
       }
       return {
         ...state,
+        phase: 'answering',
         transcript: [...state.transcript, { kind: 'assistant', text: ev.text }],
       };
     }
@@ -313,11 +429,13 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
             color: toolCallColor(ev.name),
           },
         ],
+        phase: 'running-tool',
       };
     case 'tool-result': {
       if (!ev.err && isShellTool(ev.name) && isSuccessfulEmptyShellResult(ev.result)) {
         return {
           ...state,
+          phase: 'answering',
           transcript: [...state.transcript, { kind: 'tool-result', text: 'Done', prefix: '  ⎿ ' }],
         };
       }
@@ -333,6 +451,7 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
         if (friendly !== null) {
           return {
             ...state,
+            phase: 'answering',
             transcript: [
               ...state.transcript,
               { kind: 'tool-result', text: `${prefix}\n${friendly}` },
@@ -350,11 +469,13 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       if (!view.collapsible) {
         return {
           ...state,
+          phase: 'answering',
           transcript: [...state.transcript, { kind: 'tool-result', text: collapsedText }],
         };
       }
       return {
         ...state,
+        phase: 'answering',
         transcript: [
           ...state.transcript,
           {
@@ -369,12 +490,20 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
     case 'error':
       return {
         ...state,
+        phase: state.busy ? 'answering' : state.phase,
         transcript: [...state.transcript, { kind: 'error', text: ev.err.message }],
       };
     case 'compact':
       return {
         ...state,
+        phase: 'planning',
         transcript: [...state.transcript, { kind: 'system', text: `compacted: ${ev.summary}` }],
+      };
+    case 'decision':
+      return {
+        ...state,
+        phase: 'planning',
+        transcript: [...state.transcript, { kind: 'decision', text: ev.summary }],
       };
     case 'skill-active':
       return { ...state, activeSkill: ev.name };
@@ -387,10 +516,11 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
         return {
           ...state,
           busy: false,
+          phase: 'idle',
           transcript: [...state.transcript.slice(0, -1), finalized],
         };
       }
-      return { ...state, busy: false };
+      return { ...state, busy: false, phase: 'idle' };
     }
     default: {
       const _exhaustive: never = ev;

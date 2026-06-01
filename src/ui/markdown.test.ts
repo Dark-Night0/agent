@@ -185,6 +185,15 @@ describe('renderMarkdown', () => {
     expect(renderMarkdown('')).toBe('');
   });
 
+  it('hides standalone proposed_plan wrapper tags', () => {
+    const input = '<proposed_plan>\n# Summary\n- recon target\n</proposed_plan>';
+    const stripped = stripAnsi(renderMarkdown(input));
+    expect(stripped).toContain('Summary');
+    expect(stripped).toContain('• recon target');
+    expect(stripped).not.toContain('<proposed_plan>');
+    expect(stripped).not.toContain('</proposed_plan>');
+  });
+
   it('keeps newlines so the transcript can window correctly', () => {
     const out = renderMarkdown('line1\nline2\nline3');
     expect(out.split('\n')).toHaveLength(3);

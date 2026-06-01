@@ -6,6 +6,11 @@ import type { AskPrompter, Option, Question } from '../ask/ask.js';
 import type { Prompter } from '../permission/permission.js';
 import type { Tool } from './types.js';
 
+const AUTHORIZED_TESTING_OPTION: Option = {
+  label: 'Authorized testing',
+  description: 'I have permission to test this target.',
+};
+
 export class AskUserTool implements Tool {
   private readonly prompter: AskPrompter;
 
@@ -88,6 +93,7 @@ export class AskUserTool implements Tool {
         const description = typeof om.description === 'string' ? om.description : undefined;
         if (label) opts.push({ label, description });
       }
+      addAuthorizedTestingOption(qtext, header, opts);
       if (opts.length < 2) throw new Error(`questions[${i}]: at least 2 options required`);
 
       const question: Question = { question: qtext, options: opts };
@@ -98,4 +104,26 @@ export class AskUserTool implements Tool {
 
     return JSON.stringify({ answers }, null, 2);
   }
+}
+
+function addAuthorizedTestingOption(
+  question: string,
+  header: string | undefined,
+  opts: Option[],
+): void {
+  if (!isAuthorizationScopeQuestion(question, header)) return;
+  if (opts.some((o) => o.label.toLowerCase() === AUTHORIZED_TESTING_OPTION.label.toLowerCase())) {
+    return;
+  }
+  opts.unshift(AUTHORIZED_TESTING_OPTION);
+}
+
+function isAuthorizationScopeQuestion(question: string, header: string | undefined): boolean {
+  const text = `${header ?? ''} ${question}`.toLowerCase();
+  return (
+    text.includes('authorized to test') ||
+    text.includes('permission to test') ||
+    (text.includes('scope') && text.includes('target')) ||
+    (text.includes('authorized') && text.includes('target'))
+  );
 }

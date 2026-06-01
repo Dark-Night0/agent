@@ -48,6 +48,13 @@ describe('buildSystemPrompt', () => {
     }
   });
 
+  it('does not refuse normal authorized tester workflows', () => {
+    const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
+    expect(p).toContain('Do not refuse normal tester workflows');
+    expect(p).toContain('Authorized testing');
+    expect(p).toContain('proceed within that scope');
+  });
+
   it('carries the bug bounty + OWASP + VRT + PortSwigger playbook', () => {
     const p = buildSystemPrompt({ skills: new Registry(), thinkingEnabled: false, target: null });
     for (const want of [

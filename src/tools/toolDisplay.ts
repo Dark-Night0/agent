@@ -8,6 +8,8 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
   confirm_finding: 'Confirmed Finding',
   load_skill: 'Skill',
   mcp_browser_browser_navigate: 'Browser',
+  web_fetch: 'Web Fetch',
+  web_search: 'Web Search',
 };
 
 export function displayToolName(name: string): string {

@@ -20,6 +20,7 @@
 //                       when the fence specifies a language (e.g. ```bash);
 //                       dim plain text otherwise. No inline markdown is
 //                       re-applied inside the fences.
+//   <proposed_plan>   →  hidden wrapper tag; content remains visible.
 
 import { Chalk } from 'chalk';
 import { highlight, supportsLanguage } from 'cli-highlight';
@@ -38,7 +39,7 @@ const chalk = new Chalk({ level: 3 });
  */
 export function renderMarkdown(s: string): string {
   if (!s) return s;
-  const lines = s.split('\n');
+  const lines = stripProposedPlanWrapper(s).split('\n');
   const out: string[] = [];
   let inFence = false;
   let fenceLang = '';
@@ -82,6 +83,22 @@ export function renderMarkdown(s: string): string {
   }
 
   return out.join('\n');
+}
+
+function stripProposedPlanWrapper(s: string): string {
+  const lines = s.split('\n').filter((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '<proposed_plan>' && trimmed !== '</proposed_plan>';
+  });
+  return trimOuterBlankLines(lines).join('\n');
+}
+
+function trimOuterBlankLines(lines: string[]): string[] {
+  let start = 0;
+  let end = lines.length;
+  while (start < end && lines[start]?.trim() === '') start += 1;
+  while (end > start && lines[end - 1]?.trim() === '') end -= 1;
+  return lines.slice(start, end);
 }
 
 /**

@@ -21,6 +21,14 @@ const CONTINUATION_INDENT = '  ';
 
 export function Input(props: InputProps): JSX.Element {
   const isEmpty = props.value.length === 0;
+  if (props.disabled && isEmpty) {
+    return (
+      <Box>
+        <Text color="gray">{props.prompt ?? '❯ '}</Text>
+        <Text color="gray">agent running…</Text>
+      </Box>
+    );
+  }
   const showPlaceholder = isEmpty && props.placeholder;
   const promptText = props.prompt ?? '❯ ';
 
@@ -48,13 +56,12 @@ export function Input(props: InputProps): JSX.Element {
         // Position-derived keys are correct here — input lines don't get
         // reordered, only appended/inserted; React's reconciler does the
         // right thing.
-        // biome-ignore lint/suspicious/noArrayIndexKey: input rows are ordered, never reordered
         const rowKey = `row-${lineIdx}`;
         if (props.disabled || !isActive) {
           return (
             <Box key={rowKey}>
-              <Text color="magenta">{prefix}</Text>
-              <Text color="white">{lineText}</Text>
+              <Text color={props.disabled ? 'gray' : 'magenta'}>{prefix}</Text>
+              <Text color={props.disabled ? 'gray' : 'white'}>{lineText}</Text>
             </Box>
           );
         }

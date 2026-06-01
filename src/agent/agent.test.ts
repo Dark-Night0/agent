@@ -18,6 +18,7 @@ import type { AgentEvent } from './events.js';
 class FakeClient implements Client {
   private scripted: ChatResponse[];
   private idx = 0;
+  readonly requests: ChatRequest[] = [];
   constructor(scripted: ChatResponse[]) {
     this.scripted = scripted;
   }
@@ -27,7 +28,8 @@ class FakeClient implements Client {
   model(): string {
     return 'fake-model';
   }
-  async chat(_req: ChatRequest): Promise<ChatResponse> {
+  async chat(req: ChatRequest): Promise<ChatResponse> {
+    this.requests.push(req);
     const r = this.scripted[this.idx++];
     if (!r) throw new Error('FakeClient: script exhausted');
     return r;
@@ -35,6 +37,7 @@ class FakeClient implements Client {
 }
 
 class EchoTool implements Tool {
+  calls = 0;
   name(): string {
     return 'echo';
   }
@@ -48,21 +51,52 @@ class EchoTool implements Tool {
     return false;
   }
   async run(args: Record<string, unknown>): Promise<string> {
+    this.calls += 1;
     return `echoed: ${String(args.msg ?? '')}`;
   }
 }
 
 function makeAgent(scripted: ChatResponse[]): Agent {
+  return makeAgentWithClient(scripted).agent;
+}
+
+function makeAgentWithClient(scripted: ChatResponse[]): {
+  agent: Agent;
+  client: FakeClient;
+  tool: EchoTool;
+} {
   const tools = new ToolRegistry();
-  tools.register(new EchoTool());
-  return new Agent({
-    client: new FakeClient(scripted),
+  const tool = new EchoTool();
+  tools.register(tool);
+  const client = new FakeClient(scripted);
+  const agent = new Agent({
+    client,
     tools,
     skills: new SkillRegistry(),
     prompter: new AlwaysAllow(),
     store: null,
     target: new Target(),
   });
+  return { agent, client, tool };
+}
+
+function makeAgentWithSkills(
+  scripted: ChatResponse[],
+  skills: SkillRegistry,
+): {
+  agent: Agent;
+  client: FakeClient;
+} {
+  const client = new FakeClient(scripted);
+  const agent = new Agent({
+    client,
+    tools: new ToolRegistry(),
+    skills,
+    prompter: new AlwaysAllow(),
+    store: null,
+    target: new Target(),
+  });
+  return { agent, client };
 }
 
 function collect(): { events: AgentEvent[]; sink: (e: AgentEvent) => void } {
@@ -113,6 +147,111 @@ describe('Agent.run', () => {
     expect(types).toContain('tool-result');
     const result = events.find((e) => e.type === 'tool-result');
     expect(result && result.type === 'tool-result' ? result.result : '').toContain('echoed: ping');
+  });
+
+  it('omits tool definitions when tools are disabled for a turn', async () => {
+    const { agent, client } = makeAgentWithClient([
+      {
+        message: { role: 'assistant', content: 'plan only' },
+        finishReason: 'stop',
+      },
+    ]);
+    const { sink } = collect();
+    await agent.run('make a plan', new AbortController().signal, sink, { tools: false });
+    expect(client.requests[0]?.tools).toBeUndefined();
+  });
+
+  it('does not execute returned tool calls when tools are disabled', async () => {
+    const { agent, tool } = makeAgentWithClient([
+      {
+        message: {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            {
+              id: 'call_1',
+              type: 'function',
+              function: { name: 'echo', arguments: '{"msg":"blocked"}' },
+            },
+          ],
+        },
+        finishReason: 'tool_calls',
+      },
+    ]);
+    const { events, sink } = collect();
+    await agent.run('make a plan', new AbortController().signal, sink, { tools: false });
+    expect(tool.calls).toBe(0);
+    expect(events).toContainEqual({
+      type: 'error',
+      err: expect.objectContaining({ message: 'plan-only mode blocked tool calls' }),
+    });
+  });
+
+  it('injects decision guidance before the user message for normal turns', async () => {
+    const skills = new SkillRegistry();
+    skills.add({
+      name: 'recon',
+      description: 'External recon playbook for subdomain enumeration',
+      tools: [],
+      disableModelInvocation: false,
+      path: '/tmp/recon/SKILL.md',
+      body: '',
+    });
+    const { agent, client } = makeAgentWithSkills(
+      [
+        {
+          message: { role: 'assistant', content: 'ok' },
+          finishReason: 'stop',
+        },
+      ],
+      skills,
+    );
+    const { events, sink } = collect();
+    await agent.run('enumerate subdomains for example.com', new AbortController().signal, sink);
+
+    expect(events).toContainEqual({
+      type: 'decision',
+      summary: expect.stringContaining('selected skill: recon'),
+    });
+    const messages = client.requests[0]?.messages ?? [];
+    expect(messages.at(-3)).toMatchObject({
+      role: 'system',
+      content: expect.stringContaining('Decision planner guidance'),
+    });
+    expect(messages.at(-2)).toMatchObject({
+      role: 'user',
+      content: 'enumerate subdomains for example.com',
+    });
+  });
+
+  it('skips decision guidance for plan-only turns', async () => {
+    const skills = new SkillRegistry();
+    skills.add({
+      name: 'recon',
+      description: 'External recon playbook for subdomain enumeration',
+      tools: [],
+      disableModelInvocation: false,
+      path: '/tmp/recon/SKILL.md',
+      body: '',
+    });
+    const { agent, client } = makeAgentWithSkills(
+      [
+        {
+          message: { role: 'assistant', content: 'plan' },
+          finishReason: 'stop',
+        },
+      ],
+      skills,
+    );
+    const { events, sink } = collect();
+    await agent.run('plan recon for example.com', new AbortController().signal, sink, {
+      tools: false,
+    });
+
+    expect(events.some((e) => e.type === 'decision')).toBe(false);
+    expect(client.requests[0]?.messages.some((m) => m.content.includes('Decision planner'))).toBe(
+      false,
+    );
   });
 
   it('surfaces a tool failure as a tool-result with err set', async () => {

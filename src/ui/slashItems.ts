@@ -13,7 +13,8 @@ export const SLASH_ITEMS: SlashItem[] = [
     name: '/provider',
     description: 'interactive picker: select LLM backend, then a model from its catalog',
   },
-  { name: '/model', args: '<id>', description: 'switch model directly (no picker)' },
+  { name: '/model', args: '<id|list>', description: 'switch model or list backend models' },
+  { name: '/plan', args: '[objective]', description: 'plan-only mode without tools' },
   { name: '/clear', description: 'clear the on-screen transcript only' },
   { name: '/reset', description: 'clear conversation + saved session' },
   {

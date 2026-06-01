@@ -53,17 +53,81 @@ export class WebFetchTool implements Tool {
     const inner = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     const combined = anySignal(signal, inner);
 
-    const resp = await fetch(url, {
-      method: 'GET',
-      headers: { 'User-Agent': 'pentesterflow/0.1 (+research)' },
-      signal: combined,
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(url, {
+        method: 'GET',
+        headers: {
+          Accept: 'text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8',
+          'User-Agent': 'Mozilla/5.0 pentesterflow/0.1 (+research)',
+        },
+        signal: combined,
+      });
+    } catch (err) {
+      if (signal.aborted) throw err;
+      return formatFetchFailure(url, err, inner.aborted);
+    }
     const raw = await readCapped(resp.body, FETCH_BODY_CAP);
     let text = stripHTML(raw);
     if (text.length > FETCH_TEXT_CAP) {
       text = `${text.slice(0, FETCH_TEXT_CAP)}\n[... truncated ...]`;
     }
     return `URL: ${url}\nStatus: ${resp.status} ${resp.statusText}\n\n${text}`;
+  }
+}
+
+function formatFetchFailure(url: string, err: unknown, timedOut: boolean): string {
+  const cause = err instanceof Error ? (err.cause as NodeJS.ErrnoException | undefined) : undefined;
+  const message = err instanceof Error ? err.message : String(err);
+  const detail = cause?.message ?? message;
+  const lines = [
+    `URL: ${url}`,
+    'ERROR: fetch failed',
+    `Reason: ${timedOut ? 'request timed out' : detail}`,
+  ];
+  if (cause?.code) lines.push(`Code: ${cause.code}`);
+  const host = hostnameOf(url);
+  if (host) lines.push(`Host: ${host}`);
+  const hint = fetchFailureHint(url, cause?.code);
+  if (hint) lines.push('', hint);
+  return lines.join('\n');
+}
+
+function fetchFailureHint(url: string, code: string | undefined): string {
+  const host = hostnameOf(url);
+  if (host === 'platform.hackerone.com') {
+    const handle = hackerOneHandleFromPlatformPath(url);
+    const programURL = handle
+      ? `https://hackerone.com/${handle}`
+      : 'https://hackerone.com/<program>';
+    return [
+      'Hint: platform.hackerone.com is not a public HackerOne program host.',
+      `Try the public program page instead: ${programURL}`,
+      'For scope data, use the public program page or HackerOne API with valid credentials.',
+    ].join('\n');
+  }
+  if (code === 'ENOTFOUND') return 'Hint: DNS lookup failed. Check the hostname or try web_search.';
+  if (code === 'ECONNREFUSED') return 'Hint: connection refused. Check the scheme, host, and port.';
+  if (code === 'CERT_HAS_EXPIRED' || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE') {
+    return 'Hint: TLS certificate validation failed. Use the http tool or curl when you need TLS-disabled probing.';
+  }
+  return '';
+}
+
+function hostnameOf(raw: string): string {
+  try {
+    return new URL(raw).hostname.toLowerCase();
+  } catch {
+    return '';
+  }
+}
+
+function hackerOneHandleFromPlatformPath(raw: string): string {
+  try {
+    const parts = new URL(raw).pathname.split('/').filter(Boolean);
+    return parts[0] ?? '';
+  } catch {
+    return '';
   }
 }
 
