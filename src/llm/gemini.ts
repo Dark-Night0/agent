@@ -105,9 +105,7 @@ export class GeminiClient implements Client, Pinger {
             name: fc?.name ?? '',
             arguments: JSON.stringify(fc?.args ?? {}),
           },
-          ...(thoughtSignature
-            ? { provider: { gemini: { thoughtSignature } } }
-            : {}),
+          ...(thoughtSignature ? { provider: { gemini: { thoughtSignature } } } : {}),
         };
       });
     }
