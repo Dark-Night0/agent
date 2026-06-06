@@ -1,15 +1,19 @@
 // Fetch the list of available models from an LLM backend. Used by the
 // interactive /provider flow to populate the model picker after the user
-// chooses Ollama / LM Studio / openai-compat / Kimi / Groq / Gemini.
+// chooses Ollama / LM Studio / openai-compat / Kimi / Groq / OpenRouter / DeepSeek / Gemini.
 
 import type { Backend } from '../config/config.js';
 import {
+  DEEPSEEK_DEFAULT_BASE_URL,
+  DEEPSEEK_MODELS,
   GEMINI_DEFAULT_BASE_URL,
   GEMINI_RECOMMENDED_MODELS,
   GROQ_DEFAULT_BASE_URL,
   GROQ_MODELS,
   KIMI_DEFAULT_BASE_URL,
   KIMI_MODELS,
+  OPENROUTER_DEFAULT_BASE_URL,
+  OPENROUTER_RECOMMENDED_MODELS,
 } from './providers.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -20,6 +24,8 @@ const DEFAULT_BASE_URL: Record<Exclude<Backend, ''>, string> = {
   'openai-compat': '',
   kimi: KIMI_DEFAULT_BASE_URL,
   groq: GROQ_DEFAULT_BASE_URL,
+  openrouter: OPENROUTER_DEFAULT_BASE_URL,
+  deepseek: DEEPSEEK_DEFAULT_BASE_URL,
   gemini: GEMINI_DEFAULT_BASE_URL,
 };
 
@@ -33,6 +39,8 @@ const DEFAULT_BASE_URL: Record<Exclude<Backend, ''>, string> = {
  *   openai-compat → GET <base>/models    → same as lmstudio (Bearer header)
  *   kimi          → GET <base>/models    → same as openai-compat (Bearer header)
  *   groq          → GET <base>/models    → same as openai-compat (Bearer header)
+ *   openrouter    → GET <base>/models    → same as openai-compat (Bearer header)
+ *   deepseek      → GET <base>/models    → same as openai-compat (Bearer header)
  *   gemini        → GET <base>/models?key=... → { models: [{ name }] }
  */
 export async function listModels(
@@ -104,11 +112,22 @@ function parseModels(backend: Exclude<Backend, ''>, body: unknown): string[] {
     .filter((n): n is string => n.length > 0);
   if (backend === 'kimi') return preferKnownModels(ids, KIMI_MODELS);
   if (backend === 'groq') return preferKnownModels(ids, GROQ_MODELS);
+  if (backend === 'openrouter') {
+    return preferOpenRouterModels(ids);
+  }
+  if (backend === 'deepseek') return preferKnownModels(ids, DEEPSEEK_MODELS);
   return ids;
 }
 
 function preferGeminiRecommended(models: string[]): string[] {
   return preferKnownModels(models, GEMINI_RECOMMENDED_MODELS, { appendUnknown: true });
+}
+
+function preferOpenRouterModels(models: string[]): string[] {
+  const withAuto = models.includes('openrouter/auto')
+    ? models
+    : [...OPENROUTER_RECOMMENDED_MODELS, ...models];
+  return preferKnownModels(withAuto, OPENROUTER_RECOMMENDED_MODELS, { appendUnknown: true });
 }
 
 function preferKnownModels(

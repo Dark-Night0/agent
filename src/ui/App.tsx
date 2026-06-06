@@ -1173,6 +1173,10 @@ function backendLabel(backend: Backend): string {
       return 'Kimi';
     case 'groq':
       return 'Groq';
+    case 'openrouter':
+      return 'OpenRouter';
+    case 'deepseek':
+      return 'DeepSeek';
     case 'gemini':
       return 'Gemini';
   }
