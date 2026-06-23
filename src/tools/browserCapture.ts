@@ -14,32 +14,6 @@ import { type Tool, argNumber, argString } from './types.js';
 
 const TOOL_PREFIX = 'browser_capture_';
 
-// Overall char cap on a single tool result so a large capture store can't blow
-// the model's context. Listings are also bounded by record count before
-// serialization, and serialized compactly (no indent) to fit more signal.
-const OUTPUT_CHAR_CAP = 64 * 1024;
-const DEFAULT_LIST_LIMIT = 200;
-const MAX_REQUESTS_LIMIT = 500;
-
-/** Compact-stringify a value and apply the overall char cap with a note. */
-function capJSON(value: unknown): string {
-  const s = JSON.stringify(value);
-  if (s.length <= OUTPUT_CHAR_CAP) return s;
-  return `${s.slice(0, OUTPUT_CHAR_CAP)}\n[... truncated ${s.length - OUTPUT_CHAR_CAP} chars ...]`;
-}
-
-/** Slice an array to `limit` records, compact-serialize, and char-cap. Appends
- *  a note when records were omitted. */
-function renderList(items: unknown[], limit: number): string {
-  const shown = items.slice(0, limit);
-  let out = JSON.stringify(shown);
-  if (items.length > limit) {
-    out += `\n[... ${items.length - limit} more omitted; showing first ${limit} ...]`;
-  }
-  if (out.length <= OUTPUT_CHAR_CAP) return out;
-  return `${out.slice(0, OUTPUT_CHAR_CAP)}\n[... truncated ${out.length - OUTPUT_CHAR_CAP} chars ...]`;
-}
-
 abstract class BaseCaptureTool implements Tool {
   protected readonly store: CaptureStore;
 
@@ -113,7 +87,7 @@ export class BrowserCaptureEndpointsTool extends BaseCaptureTool {
     });
     if (eps.length === 0)
       return 'No endpoints captured yet. Confirm the extension is running with capture enabled and the scope regex matches the target.';
-    return renderList(eps, DEFAULT_LIST_LIMIT);
+    return JSON.stringify(eps, null, 2);
   }
 }
 
@@ -141,8 +115,7 @@ export class BrowserCaptureRequestsTool extends BaseCaptureTool {
     };
   }
   async run(args: Record<string, unknown>): Promise<string> {
-    const requested = Math.floor(argNumber(args, 'limit') ?? 50);
-    const limit = Math.min(Math.max(1, requested), MAX_REQUESTS_LIMIT);
+    const limit = argNumber(args, 'limit') ?? 50;
     const rows = this.store.listRequests({
       urlSubstr: argString(args, 'url_contains') || undefined,
       method: argString(args, 'method') || undefined,
@@ -159,7 +132,7 @@ export class BrowserCaptureRequestsTool extends BaseCaptureTool {
       elapsedMs: r.elapsedMs,
       receivedAt: new Date(r.receivedAt).toISOString(),
     }));
-    return capJSON(slim);
+    return JSON.stringify(slim, null, 2);
   }
 }
 
@@ -251,9 +224,6 @@ export class BrowserCaptureClearTool extends BaseCaptureTool {
         'Wipes all captured requests, endpoints, and snapshots from memory. Forwarding continues — new captures will repopulate the store.',
     };
   }
-  permissionHints(): { noSessionCache: boolean } {
-    return { noSessionCache: true };
-  }
   async run(): Promise<string> {
     this.store.clear();
     return 'cleared.';
@@ -273,9 +243,10 @@ export class BrowserCaptureBurpTasksTool extends BaseCaptureTool {
   async run(): Promise<string> {
     const tasks = this.store.listBurpTasks();
     if (tasks.length === 0) return 'No Burp tasks queued.';
-    return renderList(
+    return JSON.stringify(
       tasks.map((t) => ({ ...t, createdAt: new Date(t.createdAt).toISOString() })),
-      DEFAULT_LIST_LIMIT,
+      null,
+      2,
     );
   }
 }
@@ -293,9 +264,10 @@ export class BrowserCaptureBurpIssuesTool extends BaseCaptureTool {
   async run(): Promise<string> {
     const issues = this.store.listBurpIssues();
     if (issues.length === 0) return 'No PentesterFlow issues queued for Burp import.';
-    return renderList(
+    return JSON.stringify(
       issues.map((i) => ({ ...i, createdAt: new Date(i.createdAt).toISOString() })),
-      DEFAULT_LIST_LIMIT,
+      null,
+      2,
     );
   }
 }

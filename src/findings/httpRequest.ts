@@ -12,6 +12,8 @@ const CURL_DATA_FLAGS = new Set([
 ]);
 
 const CURL_SKIP_VALUE_FLAGS = new Set([
+  '-A',
+  '--user-agent',
   '--connect-timeout',
   '--max-time',
   '--retry',
@@ -79,7 +81,7 @@ export function httpRequestFromCurl(command: string, fallbackMethod?: string): s
       if (arg === '--json' && !hasHeader(headers, 'content-type')) {
         headers.push('Content-Type: application/json');
       }
-      bodyParts.push(encodeCurlData(arg, value));
+      bodyParts.push(value);
       if (!method) method = 'POST';
       continue;
     }
@@ -88,7 +90,7 @@ export function httpRequestFromCurl(command: string, fallbackMethod?: string): s
       if (dataEq.flag === '--json' && !hasHeader(headers, 'content-type')) {
         headers.push('Content-Type: application/json');
       }
-      bodyParts.push(encodeCurlData(dataEq.flag, dataEq.value));
+      bodyParts.push(dataEq.value);
       if (!method) method = 'POST';
       continue;
     }
@@ -116,27 +118,13 @@ export function httpRequestFromCurl(command: string, fallbackMethod?: string): s
       }
       continue;
     }
-    // -A / --user-agent set the request User-Agent. Capture the value (space,
-    // attached -Avalue, and --user-agent=value forms) and emit a header so the
-    // replayed request keeps the original UA instead of falling back to the
-    // PentesterFlow default. Must run before the skip-value handling below.
-    if (arg === '-A' || arg === '--user-agent') {
-      const ua = args[++i];
-      if (ua && !hasHeader(headers, 'user-agent')) headers.push(`User-Agent: ${ua}`);
-      continue;
-    }
-    if (arg.startsWith('-A') && arg.length > 2) {
-      const ua = arg.slice(2);
-      if (ua && !hasHeader(headers, 'user-agent')) headers.push(`User-Agent: ${ua}`);
-      continue;
-    }
-    if (arg.startsWith('--user-agent=')) {
-      const ua = arg.slice('--user-agent='.length);
-      if (ua && !hasHeader(headers, 'user-agent')) headers.push(`User-Agent: ${ua}`);
-      continue;
-    }
     if (CURL_SKIP_VALUE_FLAGS.has(arg)) {
       i++;
+      continue;
+    }
+    const userAgentEq = arg.startsWith('--user-agent=') ? arg.slice('--user-agent='.length) : '';
+    if (userAgentEq && !hasHeader(headers, 'user-agent')) {
+      headers.push(`User-Agent: ${userAgentEq}`);
       continue;
     }
     if (arg.startsWith('http://') || arg.startsWith('https://')) {
@@ -182,39 +170,6 @@ function fallbackRequest(rawUrl: string, method?: string): string {
 function hasHeader(headers: string[], name: string): boolean {
   const prefix = `${name.toLowerCase()}:`;
   return headers.some((h) => h.toLowerCase().startsWith(prefix));
-}
-
-// Convert a curl data-flag value into the bytes that actually go on the wire,
-// so the rendered raw request (and its Content-Length) is valid for Burp replay
-// rather than carrying a literal, unencoded token (L7).
-function encodeCurlData(flag: string, value: string): string {
-  if (flag === '--data-urlencode') return encodeUrlencodeArg(value);
-  // --data-raw is intentionally literal — curl does NOT expand a leading @.
-  if (flag === '--data-raw') return value;
-  // -d / --data / --data-binary: a leading @ reads the body from a file, which
-  // we can't inline here. Emit a clear placeholder so Content-Length matches the
-  // emitted body instead of counting the literal "@filename".
-  if ((flag === '-d' || flag === '--data' || flag === '--data-binary') && value.startsWith('@')) {
-    return `<contents of file ${value.slice(1)}>`;
-  }
-  return value;
-}
-
-// curl --data-urlencode forms: `content`, `=content`, `name=content`, `@file`,
-// `name@file`. The content portion is percent-encoded; the name (if any) is not.
-function encodeUrlencodeArg(value: string): string {
-  if (value.startsWith('@')) return `<URL-encoded contents of file ${value.slice(1)}>`;
-  const at = value.indexOf('@');
-  const eq = value.indexOf('=');
-  if (eq >= 0 && (at < 0 || eq < at)) {
-    const name = value.slice(0, eq);
-    const content = encodeURIComponent(value.slice(eq + 1));
-    return name ? `${name}=${content}` : content;
-  }
-  if (at > 0) {
-    return `${value.slice(0, at)}=<URL-encoded contents of file ${value.slice(at + 1)}>`;
-  }
-  return encodeURIComponent(value);
 }
 
 function dataFlagValue(arg: string): { flag: string; value: string } | null {

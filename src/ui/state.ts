@@ -67,9 +67,6 @@ export interface AppState {
   yolo: boolean;
   phase: UiPhase;
   transcriptFilter: TranscriptFilter;
-  /** Display name of the tool currently executing, shown in the busy status
-   *  line while phase === 'running-tool'. Set on tool-call, cleared on done. */
-  runningTool: string | null;
 }
 
 export function initialState(banner: string, bannerData: BannerData): AppState {
@@ -87,7 +84,6 @@ export function initialState(banner: string, bannerData: BannerData): AppState {
     yolo: false,
     phase: 'idle',
     transcriptFilter: 'all',
-    runningTool: null,
   };
 }
 
@@ -117,32 +113,16 @@ export function reducer(state: AppState, action: Action): AppState {
     case 'append':
       return { ...state, transcript: [...state.transcript, action.entry] };
     case 'append-delta': {
-      // A streamed delta means the model is producing output — leave the
-      // 'planning' phase so the status line stops claiming we're still
-      // thinking. Without this, a long streamed answer shows "planning" for
-      // its entire duration and looks hung.
-      const phase: UiPhase = state.busy ? 'answering' : state.phase;
       const last = state.transcript[state.transcript.length - 1];
       if (last && last.kind === 'assistant' && last.streaming) {
-        // Fresh entry object per token so the live frame sees the new text.
-        // This rebuilds the transcript array (O(N) shallow copy) per token.
-        // We deliberately keep it rather than hoisting the streaming entry
-        // into a dedicated `state.live` field: the live entry no longer pays
-        // the markdown/highlight cost per token (Transcript renders it as
-        // plain text — see plainRowsForEntry), so the shallow array copy is a
-        // cheap O(N) of references, and a `state.live` split would ripple
-        // through every reducer case (assistant-text, done, expand) and the
-        // `transcript.at(-1)` consumers/tests for no meaningful gain.
         const updated = { ...last, text: last.text + action.text };
         return {
           ...state,
-          phase,
           transcript: [...state.transcript.slice(0, -1), updated],
         };
       }
       return {
         ...state,
-        phase,
         transcript: [
           ...state.transcript,
           { kind: 'assistant', text: action.text, streaming: true },
@@ -259,56 +239,6 @@ function isShellTool(name: string): boolean {
 
 function toolCallColor(name: string): string | undefined {
   return name === 'confirm_finding' ? 'red' : undefined;
-}
-
-/** Ink text color for a finding severity. The severity is also spelled out in
- *  the card text, so color is reinforcement, not the sole signal (keeps it
- *  legible for color-blind users / NO_COLOR). */
-function severityColor(severity: string): string {
-  switch (severity) {
-    case 'critical':
-      return 'magenta';
-    case 'high':
-      return 'red';
-    case 'medium':
-      return 'yellow';
-    case 'low':
-      return 'cyan';
-    case 'info':
-      return 'gray';
-    default:
-      return 'yellow';
-  }
-}
-
-/**
- * Build a severity-colored finding card from a confirm_finding tool call's
- * args. Returns null when the args don't parse or lack a title, so the caller
- * can fall back to the normal tool-call rendering.
- */
-function formatFindingCard(argsJSON: string): { text: string; color: string } | null {
-  let a: Record<string, unknown>;
-  try {
-    a = JSON.parse(argsJSON) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-  const str = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '');
-  const title = str('title');
-  if (!title) return null;
-  const severity = str('severity').toLowerCase();
-  const method = str('method');
-  const url = str('url');
-  const parameter = str('parameter');
-  const impact = str('impact');
-
-  const lines = [`${severity ? severity.toUpperCase() : 'FINDING'} · ${title}`];
-  if (url) {
-    const loc = `${method ? `${method} ` : ''}${url}${parameter ? `  (param: ${parameter})` : ''}`;
-    lines.push(`  ${loc}`);
-  }
-  if (impact) lines.push(`  impact: ${impact}`);
-  return { text: lines.join('\n'), color: severityColor(severity) };
 }
 
 function shellDisplayName(name: string): string {
@@ -461,21 +391,6 @@ function formatToolCallText(name: string, argsJSON: string): string {
   return `${displayToolName(name)} ${argsPreview}`;
 }
 
-/** Short label for the busy status line — the human action, not the raw
- *  command. Shell calls show their inferred title ("HTTP request", "Search
- *  files"); everything else shows the friendly tool name. */
-function runningToolLabel(name: string, argsJSON: string): string {
-  if (isShellTool(name)) {
-    const command = shellCommandFromArgs(argsJSON);
-    const action = command
-      ? (shellActionFromCommand(command) ?? shellLongCommandBlock(command))
-      : null;
-    if (action?.title) return `${shellDisplayName(name)} · ${action.title}`;
-    return shellDisplayName(name);
-  }
-  return displayToolName(name);
-}
-
 function isSuccessfulEmptyShellResult(result: string): boolean {
   const plain = result.replace(/\r\n/g, '\n').trimEnd();
   return plain === 'exit: 0\nstdout:';
@@ -549,24 +464,7 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
     }
     case 'assistant-delta':
       return reducer(state, { type: 'append-delta', text: ev.text });
-    case 'tool-call': {
-      // confirm_finding gets a first-class, severity-colored finding card
-      // instead of a generic tool-call line — the headline output of an
-      // engagement should stand out, not read like any other tool call.
-      if (ev.name === 'confirm_finding') {
-        const card = formatFindingCard(ev.argsJSON);
-        if (card) {
-          return {
-            ...state,
-            transcript: [
-              ...state.transcript,
-              { kind: 'finding', text: card.text, color: card.color, prefix: '★ ' },
-            ],
-            phase: 'running-tool',
-            runningTool: runningToolLabel(ev.name, ev.argsJSON),
-          };
-        }
-      }
+    case 'tool-call':
       return {
         ...state,
         transcript: [
@@ -579,21 +477,8 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
           },
         ],
         phase: 'running-tool',
-        runningTool: runningToolLabel(ev.name, ev.argsJSON),
       };
-    }
     case 'tool-result': {
-      // The finding card (rendered at tool-call) is the headline; the result
-      // just confirms where it was saved. Show that as a quiet note, not a
-      // generic "[ok] confirm_finding" line.
-      if (!ev.err && ev.name === 'confirm_finding') {
-        return {
-          ...state,
-          phase: 'answering',
-          transcript: [...state.transcript, { kind: 'tool-result', text: ev.result }],
-        };
-      }
-
       if (!ev.err && isShellTool(ev.name) && isSuccessfulEmptyShellResult(ev.result)) {
         return {
           ...state,
@@ -683,14 +568,6 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
       };
     case 'skill-active':
       return { ...state, activeSkill: ev.name };
-    case 'memory-recall':
-      return {
-        ...state,
-        transcript: [
-          ...state.transcript,
-          { kind: 'system', text: `recalled memory: ${ev.names.join(', ')}` },
-        ],
-      };
     case 'done': {
       // End of turn: finalize a trailing streaming assistant entry so it
       // moves out of the live frame and into the committed scrollback log.
@@ -701,11 +578,10 @@ function applyAgentEvent(state: AppState, ev: AgentEvent): AppState {
           ...state,
           busy: false,
           phase: 'idle',
-          runningTool: null,
           transcript: [...state.transcript.slice(0, -1), finalized],
         };
       }
-      return { ...state, busy: false, phase: 'idle', runningTool: null };
+      return { ...state, busy: false, phase: 'idle' };
     }
     default: {
       const _exhaustive: never = ev;

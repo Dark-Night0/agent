@@ -1,20 +1,11 @@
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { appendFile, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { apply as redact } from '../redact/index.js';
 
 export type IntelligenceScope = 'project' | 'personal' | 'builtin';
-
-// Upper bound on persisted scenarios per scope file, so the JSONL knowledge
-// base can't grow without limit across many sessions (M13).
-const MAX_SCENARIOS_PER_FILE = 5000;
-
-// Recency boost: at equal token overlap a fresher scenario outranks a stale one
-// by up to RECENCY_BOOST (decaying with age), so recent lessons surface first.
-const RECENCY_BOOST = 0.25;
-const RECENCY_HALF_LIFE_MS = 14 * 24 * 60 * 60 * 1000;
 
 export interface IntelligenceScenario {
   id: string;
@@ -85,14 +76,6 @@ const BUILTIN_SCENARIOS: IntelligenceScenario[] = [
 export class IntelligenceStore {
   readonly projectPath: string;
   readonly personalPath: string;
-  // Per-file parsed-scenario cache keyed on {mtimeMs, size}. search()/list() run
-  // on the hot path (every turn) and learnFromText re-reads each scope per
-  // candidate; caching collapses repeated reads to a single parse until the file
-  // changes. This process's own writes invalidate explicitly.
-  private readonly fileCache = new Map<
-    string,
-    { mtimeMs: number; size: number; scenarios: IntelligenceScenario[] }
-  >();
 
   constructor(opts: StoreOptions = {}) {
     const cwd = resolve(opts.cwd ?? process.cwd());
@@ -103,54 +86,20 @@ export class IntelligenceStore {
 
   list(): IntelligenceScenario[] {
     return dedupeScenarios([
-      ...this.readScenarios(this.projectPath, 'project'),
-      ...this.readScenarios(this.personalPath, 'personal'),
+      ...readJSONL(this.projectPath, 'project'),
+      ...readJSONL(this.personalPath, 'personal'),
       ...BUILTIN_SCENARIOS,
     ]);
-  }
-
-  // Cached read of a scope file. Invalidated when the file's mtime or size
-  // changes, and explicitly by this store's own writes.
-  private readScenarios(path: string, scope: IntelligenceScope): IntelligenceScenario[] {
-    if (!existsSync(path)) return [];
-    let st: { mtimeMs: number; size: number };
-    try {
-      const s = statSync(path);
-      st = { mtimeMs: s.mtimeMs, size: s.size };
-    } catch {
-      return [];
-    }
-    const cached = this.fileCache.get(path);
-    if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached.scenarios;
-    const scenarios = readJSONL(path, scope);
-    this.fileCache.set(path, { ...st, scenarios });
-    return scenarios;
-  }
-
-  private invalidate(path: string): void {
-    this.fileCache.delete(path);
   }
 
   search(query: string, limit = 5): SearchResult[] {
     const tokens = tokenize(query);
     if (tokens.length === 0) return [];
-    const scenarios = this.list();
-    // Reference point for the recency boost: the freshest scenario, keeping the
-    // ranking deterministic regardless of wall-clock time.
-    let refMs = 0;
-    for (const s of scenarios) {
-      const t = scenarioTimeMs(s);
-      if (t > refMs) refMs = t;
-    }
     const results: SearchResult[] = [];
-    for (const scenario of scenarios) {
+    for (const scenario of this.list()) {
       const { score, matched } = scoreScenario(scenario, tokens);
       if (score <= 0) continue;
-      results.push({
-        scenario,
-        score: score * recencyMultiplier(scenarioTimeMs(scenario), refMs),
-        matched,
-      });
+      results.push({ scenario, score, matched });
     }
     return results
       .sort((a, b) => b.score - a.score || b.scenario.confidence - a.scenario.confidence)
@@ -165,122 +114,43 @@ export class IntelligenceStore {
     },
   ): Promise<IntelligenceScenario | null> {
     const scope = input.scope ?? 'project';
-    const saved = await this.appendBatch([input], scope);
-    return saved[0] ?? null;
-  }
-
-  /**
-   * Serialize a check-then-append for a whole batch into one scope file: read
-   * the file once, dedupe candidates against an in-memory set (existing rows +
-   * earlier candidates in this batch), append all fresh rows in a single write,
-   * and prune once at the end. Replaces the per-candidate read/append/prune
-   * fan-out so a learnFromText batch touches each file just once.
-   */
-  private appendBatch(
-    candidates: ScenarioInput[],
-    scope: Exclude<IntelligenceScope, 'builtin'>,
-  ): Promise<IntelligenceScenario[]> {
-    return this.serializeWrite(async () => {
-      const path = scope === 'personal' ? this.personalPath : this.projectPath;
-      const seenIds = new Set<string>();
-      const seenKeys = new Set<string>();
-      for (const existing of this.readScenarios(path, scope)) {
-        seenIds.add(existing.id);
-        seenKeys.add(duplicateKey(existing.title, existing.category));
-      }
-      const fresh: IntelligenceScenario[] = [];
-      for (const candidate of candidates) {
-        const scenario = normalizeScenario({
-          ...candidate,
-          id: candidate.id ?? newScenarioID(),
-          createdAt: candidate.createdAt ?? new Date().toISOString(),
-          scope,
-        });
-        const key = duplicateKey(scenario.title, scenario.category);
-        if (seenIds.has(scenario.id) || seenKeys.has(key)) continue;
-        seenIds.add(scenario.id);
-        seenKeys.add(key);
-        fresh.push(scenario);
-      }
-      if (fresh.length === 0) return [];
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      await appendFile(path, fresh.map((s) => `${JSON.stringify(s)}\n`).join(''), { mode: 0o600 });
-      await chmod(path, 0o600).catch(() => undefined);
-      this.invalidate(path);
-      this.pruneIfTooLong(path, scope);
-      return fresh;
+    const scenario = normalizeScenario({
+      ...input,
+      id: input.id ?? newScenarioID(),
+      createdAt: input.createdAt ?? new Date().toISOString(),
+      scope,
     });
-  }
-
-  // In-process append lock: chains writes so each runs its duplicate check and
-  // append atomically with respect to the others. Failures don't break the
-  // chain. Both scopes share one chain — appends are infrequent (background
-  // learning), so the serialization cost is negligible.
-  private writeChain: Promise<unknown> = Promise.resolve();
-  private serializeWrite<T>(fn: () => Promise<T>): Promise<T> {
-    const run = this.writeChain.then(fn, fn);
-    this.writeChain = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
-  }
-
-  // Cap the JSONL so a long-lived knowledge base doesn't grow without bound
-  // (M13). Keeps the most recent scenarios; older ones age out.
-  private pruneIfTooLong(path: string, scope: IntelligenceScope): void {
-    try {
-      const scenarios = this.readScenarios(path, scope);
-      if (scenarios.length <= MAX_SCENARIOS_PER_FILE) return;
-      const kept = scenarios.slice(scenarios.length - MAX_SCENARIOS_PER_FILE);
-      const body = `${kept.map((s) => JSON.stringify(s)).join('\n')}\n`;
-      // Atomic rewrite: tmp + rename so a crash mid-prune can't truncate the
-      // knowledge base.
-      const tmp = `${path}.tmp.${randomBytes(3).toString('hex')}`;
-      writeFileSync(tmp, body, { mode: 0o600 });
-      renameSync(tmp, path);
-      this.invalidate(path);
-    } catch {
-      // Best effort — a prune failure must not break learning.
-    }
-  }
-
-  /**
-   * Clear learned intelligence (the background scenarios.jsonl files).
-   * This addresses the historical unbounded growth concern (M13 in AUDIT.md)
-   * beyond the automatic pruneIfTooLong (capped at 5000 most-recent).
-   * Safe to call; best-effort on errors.
-   */
-  async clear(scope: 'project' | 'personal' | 'all' = 'all'): Promise<void> {
-    const targets: ('project' | 'personal')[] = scope === 'all' ? ['project', 'personal'] : [scope];
-    for (const t of targets) {
-      const p = t === 'project' ? this.projectPath : this.personalPath;
-      try {
-        if (existsSync(p)) {
-          writeFileSync(p, '', { mode: 0o600 });
-        }
-        this.invalidate(p);
-      } catch {
-        // best effort
-      }
-    }
-  }
-
-  /** Return approximate counts for the two scopes (useful for /memory style UX). */
-  getStats(): { project: number; personal: number } {
-    const proj = this.readScenarios(this.projectPath, 'project').length;
-    const pers = this.readScenarios(this.personalPath, 'personal').length;
-    return { project: proj, personal: pers };
+    if (this.hasDuplicate(scenario)) return null;
+    const path = scope === 'personal' ? this.personalPath : this.projectPath;
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    await appendFile(path, `${JSON.stringify(scenario)}\n`, { mode: 0o600 });
+    await chmod(path, 0o600).catch(() => undefined);
+    return scenario;
   }
 
   async learnFromText(text: string, sourceSessionId?: string): Promise<IntelligenceScenario[]> {
     const cleaned = redact(text);
-    const candidates = extractScenarios(cleaned, sourceSessionId);
-    if (candidates.length === 0) return [];
-    // One batched read/append/prune per scope instead of two per candidate.
-    const project = await this.appendBatch(candidates, 'project');
-    const personal = await this.appendBatch(candidates, 'personal');
-    return [...project, ...personal];
+    const learned: IntelligenceScenario[] = [];
+    for (const candidate of extractScenarios(cleaned, sourceSessionId)) {
+      const projectSaved = await this.append({ ...candidate, scope: 'project' });
+      if (projectSaved) learned.push(projectSaved);
+      const personalSaved = await this.append({ ...candidate, scope: 'personal' });
+      if (personalSaved) learned.push(personalSaved);
+    }
+    return learned;
+  }
+
+  private hasDuplicate(scenario: IntelligenceScenario): boolean {
+    const wantedTitle = normalizeKey(scenario.title);
+    const wantedCategory = normalizeKey(scenario.category);
+    const path = scenario.scope === 'personal' ? this.personalPath : this.projectPath;
+    return readJSONL(path, scenario.scope).some((existing) => {
+      if (existing.id === scenario.id) return true;
+      return (
+        normalizeKey(existing.title) === wantedTitle &&
+        normalizeKey(existing.category) === wantedCategory
+      );
+    });
   }
 }
 
@@ -768,23 +638,20 @@ function scoreScenario(
   s: IntelligenceScenario,
   queryTokens: string[],
 ): { score: number; matched: string[] } {
-  // Lowercase each field's text once per scenario (not once per query token):
-  // search() calls this for every scenario every turn, and the inner loop ran
-  // text.toLowerCase() for every (field × token) pair before.
   const fields: Array<[string, number, string]> = [
-    [s.title.toLowerCase(), 7, 'title'],
-    [s.category.toLowerCase(), 5, 'category'],
-    [s.triggers.join(' ').toLowerCase(), 8, 'triggers'],
-    [s.technologies.join(' ').toLowerCase(), 6, 'technology'],
-    [s.recommendedChecks.join(' ').toLowerCase(), 5, 'recommendedChecks'],
-    [s.avoidMissing.join(' ').toLowerCase(), 4, 'avoidMissing'],
-    [s.lesson.toLowerCase(), 2, 'lesson'],
+    [s.title, 7, 'title'],
+    [s.category, 5, 'category'],
+    [s.triggers.join(' '), 8, 'triggers'],
+    [s.technologies.join(' '), 6, 'technology'],
+    [s.recommendedChecks.join(' '), 5, 'recommendedChecks'],
+    [s.avoidMissing.join(' '), 4, 'avoidMissing'],
+    [s.lesson, 2, 'lesson'],
   ];
   let score = 0;
   const matched = new Set<string>();
   for (const token of queryTokens) {
-    for (const [lowerText, weight, label] of fields) {
-      if (!tokenMatchesLower(lowerText, token)) continue;
+    for (const [text, weight, label] of fields) {
+      if (!tokenMatches(text, token)) continue;
       score += weight;
       matched.add(`${label}:${token}`);
     }
@@ -793,26 +660,10 @@ function scoreScenario(
   return { score, matched: [...matched] };
 }
 
-// `lowerText` is already lowercased; `token` comes from tokenize() lowercased.
-function tokenMatchesLower(lowerText: string, token: string): boolean {
-  if (lowerText.includes(token)) return true;
-  return token.includes('.') && lowerText.includes(token.replace(/\./g, ' '));
-}
-
-function duplicateKey(title: string, category: string): string {
-  return `${normalizeKey(category)}\n${normalizeKey(title)}`;
-}
-
-function scenarioTimeMs(s: IntelligenceScenario): number {
-  const t = Date.parse(s.updatedAt ?? s.createdAt ?? '');
-  return Number.isFinite(t) ? t : 0;
-}
-
-/** 1 → 1+RECENCY_BOOST as a scenario approaches `refMs`, decaying with age. */
-function recencyMultiplier(timeMs: number, refMs: number): number {
-  if (timeMs <= 0 || refMs <= 0) return 1;
-  const age = Math.max(0, refMs - timeMs);
-  return 1 + RECENCY_BOOST * 2 ** (-age / RECENCY_HALF_LIFE_MS);
+function tokenMatches(text: string, token: string): boolean {
+  const lower = text.toLowerCase();
+  if (lower.includes(token)) return true;
+  return token.includes('.') && lower.includes(token.replace(/\./g, ' '));
 }
 
 function tokenize(text: string): string[] {

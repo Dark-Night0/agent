@@ -1,15 +1,9 @@
 // Fetch the list of available models from an LLM backend. Used by the
 // interactive /provider flow to populate the model picker after the user
-// chooses Ollama / LM Studio / openai-compat / Kimi / Groq / OpenRouter / DeepSeek / Gemini /
-// Anthropic.
+// chooses Ollama / LM Studio / openai-compat / Kimi / Groq / Gemini.
 
 import type { Backend } from '../config/config.js';
 import {
-  ANTHROPIC_DEFAULT_BASE_URL,
-  ANTHROPIC_RECOMMENDED_MODELS,
-  ANTHROPIC_VERSION,
-  DEEPSEEK_DEFAULT_BASE_URL,
-  DEEPSEEK_MODELS,
   GEMINI_DEFAULT_BASE_URL,
   GEMINI_RECOMMENDED_MODELS,
   GROQ_DEFAULT_BASE_URL,
@@ -17,7 +11,6 @@ import {
   KIMI_DEFAULT_BASE_URL,
   KIMI_MODELS,
   OPENROUTER_DEFAULT_BASE_URL,
-  OPENROUTER_RECOMMENDED_MODELS,
 } from './providers.js';
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -28,10 +21,8 @@ const DEFAULT_BASE_URL: Record<Exclude<Backend, ''>, string> = {
   'openai-compat': '',
   kimi: KIMI_DEFAULT_BASE_URL,
   groq: GROQ_DEFAULT_BASE_URL,
-  openrouter: OPENROUTER_DEFAULT_BASE_URL,
-  deepseek: DEEPSEEK_DEFAULT_BASE_URL,
   gemini: GEMINI_DEFAULT_BASE_URL,
-  anthropic: ANTHROPIC_DEFAULT_BASE_URL,
+  openrouter: OPENROUTER_DEFAULT_BASE_URL,
 };
 
 /**
@@ -44,10 +35,8 @@ const DEFAULT_BASE_URL: Record<Exclude<Backend, ''>, string> = {
  *   openai-compat → GET <base>/models    → same as lmstudio (Bearer header)
  *   kimi          → GET <base>/models    → same as openai-compat (Bearer header)
  *   groq          → GET <base>/models    → same as openai-compat (Bearer header)
- *   openrouter    → GET <base>/models    → same as openai-compat (Bearer header)
- *   deepseek      → GET <base>/models    → same as openai-compat (Bearer header)
  *   gemini        → GET <base>/models?key=... → { models: [{ name }] }
- *   anthropic     → GET <base>/models    → { data: [{ id }] } (x-api-key + anthropic-version)
+ *   openrouter    → GET <base>/models    → same as openai-compat (Bearer header)
  */
 export async function listModels(
   backend: Backend,
@@ -59,17 +48,9 @@ export async function listModels(
   const base = baseURL || DEFAULT_BASE_URL[b];
   if (!base) throw new Error(`${b} backend requires a base URL`);
 
-  const path = b === 'ollama' ? '/api/tags' : '/models';
+  const path = b === 'ollama' ? '/api/tags' : b === 'gemini' ? '/models' : '/models';
   const headers: Record<string, string> = {};
-  if (apiKey && b === 'gemini') {
-    // Gemini takes the key as a header, not a query param, so it stays out of logs.
-    headers['x-goog-api-key'] = apiKey;
-  } else if (b === 'anthropic') {
-    // Anthropic authenticates with x-api-key (not Bearer) and requires a
-    // pinned wire version on every request, including the model list.
-    if (apiKey) headers['x-api-key'] = apiKey;
-    headers['anthropic-version'] = ANTHROPIC_VERSION;
-  } else if (apiKey && b !== 'ollama') {
+  if (apiKey && b !== 'ollama' && b !== 'gemini') {
     headers.Authorization = `Bearer ${apiKey}`;
   }
 
@@ -80,7 +61,8 @@ export async function listModels(
   const timer = setTimeout(() => ctl.abort(), DEFAULT_TIMEOUT_MS);
 
   try {
-    const resp = await fetch(`${base}${path}`, {
+    const suffix = b === 'gemini' ? `?key=${encodeURIComponent(apiKey)}` : '';
+    const resp = await fetch(`${base}${path}${suffix}`, {
       method: 'GET',
       headers,
       signal: ctl.signal,
@@ -125,27 +107,11 @@ function parseModels(backend: Exclude<Backend, ''>, body: unknown): string[] {
     .filter((n): n is string => n.length > 0);
   if (backend === 'kimi') return preferKnownModels(ids, KIMI_MODELS);
   if (backend === 'groq') return preferKnownModels(ids, GROQ_MODELS);
-  if (backend === 'openrouter') {
-    return preferOpenRouterModels(ids);
-  }
-  if (backend === 'deepseek') return preferKnownModels(ids, DEEPSEEK_MODELS);
-  if (backend === 'anthropic') {
-    // Anthropic's /v1/models uses the same { data: [{ id }] } envelope; float
-    // the known recommended ids to the top, keep any newer ones below.
-    return preferKnownModels(ids, ANTHROPIC_RECOMMENDED_MODELS, { appendUnknown: true });
-  }
   return ids;
 }
 
 function preferGeminiRecommended(models: string[]): string[] {
   return preferKnownModels(models, GEMINI_RECOMMENDED_MODELS, { appendUnknown: true });
-}
-
-function preferOpenRouterModels(models: string[]): string[] {
-  const withAuto = models.includes('openrouter/auto')
-    ? models
-    : [...OPENROUTER_RECOMMENDED_MODELS, ...models];
-  return preferKnownModels(withAuto, OPENROUTER_RECOMMENDED_MODELS, { appendUnknown: true });
 }
 
 function preferKnownModels(

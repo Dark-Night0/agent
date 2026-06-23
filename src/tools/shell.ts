@@ -5,37 +5,11 @@
 
 import { spawn } from 'node:child_process';
 import type { Prompter } from '../permission/permission.js';
-import { decodeUtf8Capped } from './file.js';
 import { type Tool, argString } from './types.js';
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000;
-const MAX_OUTPUT_BYTES = 64 * 1024;
-
-// Windows has no /bin/sh or /bin/bash, so spawning the Unix shell path fails
-// with `ENOENT: no such file or directory, uv_spawn '/bin/sh'`. On Windows we
-// run commands through PowerShell instead — it is closer to the Unix idioms the
-// tool descriptions assume than cmd.exe, and supports pipelines/quoting cleanly.
-// Override with PFLOW_WINDOWS_SHELL (e.g. "pwsh.exe" or "%ComSpec%") if needed.
-// Evaluated at call time (not module load) so tests can exercise both paths.
-function isWindows(): boolean {
-  return process.platform === 'win32';
-}
-
-/**
- * Build the spawn target for a command string on the current platform.
- * POSIX: `<unixShell> -c "<command>"`. Windows: PowerShell `-Command`.
- */
-export function shellInvocation(
-  unixShell: string,
-  command: string,
-): { cmd: string; argv: string[] } {
-  if (isWindows()) {
-    const shell = process.env.PFLOW_WINDOWS_SHELL || 'powershell.exe';
-    return { cmd: shell, argv: ['-NoProfile', '-NonInteractive', '-Command', command] };
-  }
-  return { cmd: unixShell, argv: ['-c', command] };
-}
+const MAX_OUTPUT_BYTES = 32 * 1024;
 
 /**
  * Advisory denylist for catastrophic commands. This is defense-in-depth
@@ -49,7 +23,6 @@ export const DENY_PATTERNS: RegExp[] = [
   // Matches short (-rf, -fr) and long (--recursive --force) flag forms, in
   // either order; deeper paths like /home/user are left to the operator.
   /\brm\b(?=[^|;&\n]*\s-{1,2}[a-z-]*r)(?=[^|;&\n]*\s-{1,2}[a-z-]*f)[^|;&\n]*\s\/[^/\s]*\/?(?:\s|$)/i,
-  /\brm\b(?=[^|;&\n]*\s-{1,2}[a-z-]*r)(?=[^|;&\n]*\s-{1,2}[a-z-]*f)[^|;&\n]*\s["']\/[^/"'\s]*\/?["'](?:\s|$)/i,
   /:\(\)\s*\{\s*:\|:&\s*\}/i, // fork bomb
   /\bmkfs\b/i,
   /\bdd\b[^|;&\n]*\bof=\/dev\//i,
@@ -104,13 +77,6 @@ const PORTABILITY_PATTERNS: Array<{ re: RegExp; message: string }> = [
   },
 ];
 
-// Only rewrite `grep` at a command position (start of string or right after a
-// shell separator), so a literal `grep -P ...` inside an `echo`/`awk` string is
-// not matched and corrupted. The leading separator + whitespace are captured so
-// the rewrite can re-emit them verbatim.
-const GREP_P_RE =
-  /(^|[\n|;&(])([ \t]*)grep\s+((?:(?:-[A-Za-z]+|--perl-regexp)\s+)*)((?:'[^']*')|(?:"[^"]*")|(?:\\.|[^\s|;&])+)([^|;&\n]*)/g;
-
 export class ShellTool implements Tool {
   private readonly shellPath: string;
   private readonly toolName: string;
@@ -125,14 +91,6 @@ export class ShellTool implements Tool {
   }
 
   description(): string {
-    if (isWindows()) {
-      return [
-        'Run a shell command via PowerShell on the local machine. Primary use case is curl/Invoke-WebRequest plus standard utilities for HTTP testing, file inspection, and one-liners. The user will be prompted to approve each command. Capture concise output — pipe through `Select-Object -First` for huge outputs. Do not run interactive commands. Authorized engagements only.',
-        'Write PowerShell-compatible commands. Unix-only tools (grep, sed, awk, jq) may be absent; prefer PowerShell equivalents (Select-String, -replace, ConvertFrom-Json) unless you know the tool is installed.',
-        '',
-        'Default to curl/Invoke-WebRequest for HTTP work; only use specialized scanners (ffuf, nuclei, sqlmap, etc.) when the user explicitly asks for them.',
-      ].join('\n');
-    }
     return [
       'Run a shell command via /bin/sh -c on the local machine. Primary use case is curl + standard Unix utilities (jq, grep, awk, sed, head, sort, uniq) for HTTP testing, file inspection, and bash one-liners. The user will be prompted to approve each command. Capture concise output — pipe through `head` for huge outputs. Do not run interactive commands. Authorized engagements only.',
       'Write portable macOS/BSD + Linux commands. Avoid GNU-only flags such as `grep -P`; prefer `grep -E`, `awk`, `sed`, `perl -ne`, or `jq` for extraction.',
@@ -147,9 +105,7 @@ export class ShellTool implements Tool {
       properties: {
         command: {
           type: 'string',
-          description: isWindows()
-            ? 'Shell command to execute. Will run via PowerShell -Command.'
-            : 'Shell command to execute. Will run via /bin/sh -c.',
+          description: 'Shell command to execute. Will run via /bin/sh -c.',
         },
         timeout_seconds: {
           type: 'integer',
@@ -164,38 +120,25 @@ export class ShellTool implements Tool {
     return true;
   }
 
-  // Scope an "allow session" approval to the exact command the user saw.
-  // A different command re-prompts, so approving `id` once can't silently
-  // license arbitrary later commands for the rest of the session. We do NOT
-  // set noSessionCache: re-running the identical command should stay quiet.
-  permissionHints(args: Record<string, unknown>): { cacheKey: string } {
-    return { cacheKey: rewritePortableCommand(argString(args, 'command')) };
-  }
-
   summarize(args: Record<string, unknown>): { summary: string; detail: string } {
-    const cmd = rewritePortableCommand(argString(args, 'command'));
+    const cmd = argString(args, 'command');
     const firstLine = cmd.split('\n', 1)[0] ?? '';
     const truncated = firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
     return { summary: `${this.toolName}: ${truncated}`, detail: cmd };
   }
 
   async run(args: Record<string, unknown>, signal: AbortSignal, _p: Prompter): Promise<string> {
-    const originalCmd = argString(args, 'command');
-    const cmdStr = rewritePortableCommand(originalCmd);
+    const cmdStr = argString(args, 'command');
     if (!cmdStr) throw new Error('command is required');
 
     for (const re of DENY_PATTERNS) {
-      if (re.test(originalCmd) || re.test(cmdStr)) {
+      if (re.test(cmdStr)) {
         throw new Error(`command blocked by denylist (matched ${re.source})`);
       }
     }
-    // The portability guards steer the model away from GNU-only Unix flags;
-    // they are irrelevant (and their messages misleading) under PowerShell.
-    if (!isWindows()) {
-      for (const { re, message } of PORTABILITY_PATTERNS) {
-        if (re.test(cmdStr)) {
-          throw new Error(`command blocked for portability: ${message}`);
-        }
+    for (const { re, message } of PORTABILITY_PATTERNS) {
+      if (re.test(cmdStr)) {
+        throw new Error(`command blocked for portability: ${message}`);
       }
     }
 
@@ -205,74 +148,8 @@ export class ShellTool implements Tool {
       timeoutMs = Math.min(timeoutArg * 1000, MAX_TIMEOUT_MS);
     }
 
-    const { cmd, argv } = shellInvocation(this.shellPath, cmdStr);
-    return runWithCapture(cmd, argv, timeoutMs, signal);
+    return runWithCapture(this.shellPath, ['-c', cmdStr], timeoutMs, signal);
   }
-}
-
-export function rewritePortableCommand(command: string): string {
-  // The macOS/BSD portability rewrite targets Unix tools (perl, grep). Under
-  // PowerShell on Windows it would corrupt commands, so pass them through.
-  if (isWindows()) return command;
-  return command.replace(
-    GREP_P_RE,
-    (match, sep: string, lead: string, rawFlags: string, rawPattern: string, rest: string) => {
-      const flags = rawFlags.trim().split(/\s+/).filter(Boolean);
-      const shortFlags = flags
-        .filter((flag) => /^-[A-Za-z]+$/.test(flag))
-        .map((flag) => flag.slice(1))
-        .join('');
-      const hasPerlRegexp = flags.includes('--perl-regexp') || shortFlags.includes('P');
-      if (!hasPerlRegexp) return match;
-
-      const unsupportedFlags = shortFlags.replace(/[Piovh]/g, '');
-      const hasUnsupportedLong = flags.some(
-        (flag) => flag.startsWith('--') && flag !== '--perl-regexp',
-      );
-      if (unsupportedFlags || hasUnsupportedLong) return match;
-
-      const pattern = unquoteShellToken(rawPattern);
-      if (pattern == null) return match;
-
-      const fileArgs = rest.trim();
-      // Bail if an option-like token trails the pattern (e.g. `-A3`, `--color`).
-      // grep context/format flags have no faithful perl one-liner equivalent;
-      // emitting them as bareword perl "filenames" would silently corrupt the
-      // command. Leaving the original `grep -P` lets the portability guard
-      // surface a clear message instead of producing a broken rewrite.
-      if (/(?:^|\s)-/.test(fileArgs)) return match;
-
-      const regexFlags = shortFlags.includes('i') ? 'i' : '';
-      const negate = shortFlags.includes('v');
-      const extractOnly = shortFlags.includes('o');
-      // Pass the user pattern as DATA via the environment, never inlined into
-      // the Perl source. A regex built from an interpolated *variable* matches
-      // its content as a pattern but does NOT run `@{[...]}` interpolation or
-      // `(?{...})` code blocks (those require a literal regex / `use re 'eval'`),
-      // so the portability rewrite can't become a code-execution primitive.
-      const prelude = 'BEGIN { $p = $ENV{PF_GREP_PAT} } ';
-      const code = extractOnly
-        ? `${prelude}while (/$p/${regexFlags}g) { print "$&\\n" }`
-        : negate
-          ? `${prelude}print unless /$p/${regexFlags}`
-          : `${prelude}print if /$p/${regexFlags}`;
-      const perl = `PF_GREP_PAT=${shellQuote(pattern)} perl -ne ${shellQuote(code)}`;
-      return `${sep}${lead}${perl}${fileArgs ? ` ${fileArgs}` : ''}`;
-    },
-  );
-}
-
-function unquoteShellToken(token: string): string | null {
-  if (!token) return null;
-  if (token.startsWith("'") && token.endsWith("'")) return token.slice(1, -1);
-  if (token.startsWith('"') && token.endsWith('"')) {
-    return token.slice(1, -1).replace(/\\(["\\$`])/g, '$1');
-  }
-  return token.replace(/\\(.)/g, '$1');
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** BashTool is a PascalCase alias for ShellTool that uses /bin/bash. */
@@ -282,9 +159,6 @@ export class BashTool extends ShellTool {
   }
 
   override description(): string {
-    if (isWindows()) {
-      return 'Run a command via PowerShell on the local machine (no /bin/bash on Windows; this falls back to the same PowerShell host as the shell tool). Same gating as the shell tool (per-command permission, denylist, output truncation).';
-    }
     return "Run a bash command via /bin/bash -c on the local machine. Same gating as the shell tool (per-command permission, denylist, output truncation). Prefer this over `shell` when you need bash features like [[ ]] tests, process substitution <(...), arrays, or $'...' quoting.";
   }
 }
@@ -297,44 +171,54 @@ function runWithCapture(
 ): Promise<string> {
   return new Promise((resolveOut) => {
     const controller = new AbortController();
-    let childPid = 0;
-    const onParentAbort = () => {
-      killProcessGroup(childPid);
-      controller.abort();
-    };
+    const onParentAbort = () => controller.abort();
     if (parentSignal.aborted) controller.abort();
     else parentSignal.addEventListener('abort', onParentAbort, { once: true });
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killProcessGroup(childPid);
-      controller.abort();
-    }, timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     let timedOut = false;
     timer.unref?.();
 
-    // detached lets us kill the whole process group via negative PID on POSIX.
-    // On Windows it would spawn a new console window and the group-kill model
-    // differs, so we leave it attached and rely on taskkill /T below.
-    const child = spawn(cmd, argv, { detached: !isWindows(), signal: controller.signal });
-    childPid = child.pid ?? 0;
-    // Retain the first AND last half of MAX_OUTPUT_BYTES per stream. Scanner /
-    // curl verdicts usually land in the *tail* of the output, so a head-only
-    // cap discarded exactly the bytes the model needs. Keeping both ends bounds
-    // memory (a `yes`/`cat /dev/zero` flood can't grow the buffers past the cap)
-    // while preserving the conclusion. We keep consuming all data so the child
-    // isn't blocked on backpressure; the timeout still bounds total runtime.
-    const stdoutBuf = new HeadTailBuffer(MAX_OUTPUT_BYTES);
-    const stderrBuf = new HeadTailBuffer(MAX_OUTPUT_BYTES);
-    child.stdout.on('data', (c: Buffer) => stdoutBuf.push(c));
-    child.stderr.on('data', (c: Buffer) => stderrBuf.push(c));
+    const child = spawn(cmd, argv, { signal: controller.signal });
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutLen = 0;
+    let stderrLen = 0;
+    // Track every byte received (even bytes we stop retaining past the cap)
+    // so the truncation marker is deterministic regardless of chunk sizes.
+    let stdoutTotal = 0;
+    let stderrTotal = 0;
+
+    // Only the first MAX_OUTPUT_BYTES of each stream are ever shown, so we
+    // stop *retaining* bytes past that point. Without this, a command like
+    // `yes` or `cat /dev/zero` would grow these buffers until the process
+    // OOMs — the truncate() at close caps what the model sees, not memory.
+    // We keep consuming (and discarding) data so the child isn't blocked on
+    // backpressure; the timeout still bounds total runtime.
+    child.stdout.on('data', (c: Buffer) => {
+      stdoutTotal += c.length;
+      if (stdoutLen < MAX_OUTPUT_BYTES) {
+        stdoutChunks.push(c);
+        stdoutLen += c.length;
+      }
+    });
+    child.stderr.on('data', (c: Buffer) => {
+      stderrTotal += c.length;
+      if (stderrLen < MAX_OUTPUT_BYTES) {
+        stderrChunks.push(c);
+        stderrLen += c.length;
+      }
+    });
 
     child.on('close', (code, sig) => {
       clearTimeout(timer);
       parentSignal.removeEventListener('abort', onParentAbort);
-      const stdout = stdoutBuf.render();
-      const stderr = stderrBuf.render();
+      const stdout = truncate(Buffer.concat(stdoutChunks).toString('utf8'), stdoutTotal);
+      const stderr = truncate(Buffer.concat(stderrChunks).toString('utf8'), stderrTotal);
 
+      if (controller.signal.aborted && !parentSignal.aborted) {
+        timedOut = true;
+      }
       if (timedOut) {
         resolveOut(
           `exit: timeout after ${timeoutMs / 1000}s\nstdout:\n${stdout}\nstderr:\n${stderr}`,
@@ -349,115 +233,19 @@ function runWithCapture(
     });
 
     child.on('error', (err) => {
-      if (controller.signal.aborted && err.name === 'AbortError') return;
       clearTimeout(timer);
       parentSignal.removeEventListener('abort', onParentAbort);
-      const stdout = stdoutBuf.render();
-      const stderr = stderrBuf.render();
+      const stdout = truncate(Buffer.concat(stdoutChunks).toString('utf8'), stdoutTotal);
+      const stderr = truncate(Buffer.concat(stderrChunks).toString('utf8'), stderrTotal);
       resolveOut(`exit: -1\nstdout:\n${stdout}\nstderr:\n${stderr}\nerror: ${err.message}`);
     });
   });
 }
 
-function killProcessGroup(pid: number): void {
-  if (!pid) return;
-  if (isWindows()) {
-    // No POSIX signals/process groups on Windows; taskkill /T tears down the
-    // PowerShell process and its child command tree.
-    try {
-      spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
-    } catch {
-      /* best effort */
-    }
-    return;
-  }
-  try {
-    process.kill(-pid, 'SIGTERM');
-  } catch {
-    try {
-      process.kill(pid, 'SIGTERM');
-    } catch {
-      /* already gone */
-    }
-  }
-}
-
-/**
- * Bounded byte buffer that retains the first half and last half of `cap` bytes
- * of a stream, discarding the middle. Operates on Buffers (not pre-decoded
- * strings) so the cap is a true UTF-8 *byte* budget and the elision falls on
- * codepoint boundaries instead of mid-character. Memory is bounded to ~cap plus
- * one chunk regardless of total stream size.
- */
-class HeadTailBuffer {
-  private readonly half: number;
-  private readonly head: Buffer[] = [];
-  private headLen = 0;
-  private readonly tail: Buffer[] = [];
-  private tailLen = 0;
-  private total = 0;
-
-  constructor(private readonly cap: number) {
-    this.half = Math.floor(cap / 2);
-  }
-
-  push(chunk: Buffer): void {
-    this.total += chunk.length;
-    let rest = chunk;
-    if (this.headLen < this.half) {
-      const room = this.half - this.headLen;
-      if (rest.length <= room) {
-        this.head.push(rest);
-        this.headLen += rest.length;
-        return;
-      }
-      this.head.push(rest.subarray(0, room));
-      this.headLen += room;
-      rest = rest.subarray(room);
-    }
-    this.tail.push(rest);
-    this.tailLen += rest.length;
-    // Drop whole leading chunks while doing so still leaves >= half bytes; the
-    // final subarray() at render time trims any remaining overshoot exactly.
-    while (this.tail.length > 1 && this.tailLen - (this.tail[0]?.length ?? 0) >= this.half) {
-      const dropped = this.tail.shift();
-      if (!dropped) break;
-      this.tailLen -= dropped.length;
-    }
-  }
-
-  render(): string {
-    const headBuf = Buffer.concat(this.head);
-    const tailFull = Buffer.concat(this.tail);
-    const tailBuf =
-      tailFull.length > this.half ? tailFull.subarray(tailFull.length - this.half) : tailFull;
-    const retained = headBuf.length + tailBuf.length;
-    if (this.total <= retained) {
-      // Everything fit (head + tail cover the whole stream with no gap).
-      return decodeUtf8Buffer(Buffer.concat([headBuf, tailBuf]));
-    }
-    const headStr = decodeUtf8Capped(headBuf, headBuf.length);
-    const tailStr = decodeUtf8Tail(tailBuf);
-    return `${headStr}\n[... truncated ${this.total - retained} bytes ...]\n${tailStr}`;
-  }
-}
-
-function decodeUtf8Buffer(buf: Buffer): string {
-  return buf.toString('utf8');
-}
-
-/**
- * Decode a buffer whose START may fall mid-codepoint (the head of the tail
- * slice). Skip up to 3 leading UTF-8 continuation bytes (0b10xxxxxx) so we don't
- * emit a leading U+FFFD; the buffer end is the real stream end, so no trailing
- * trim is needed.
- */
-function decodeUtf8Tail(buf: Buffer): string {
-  let start = 0;
-  while (start < buf.length && start < 3 && (buf[start] ?? 0) >= 0x80 && (buf[start] ?? 0) < 0xc0) {
-    start += 1;
-  }
-  return buf.subarray(start).toString('utf8');
+function truncate(s: string, total?: number): string {
+  const seen = total ?? s.length;
+  if (seen <= MAX_OUTPUT_BYTES) return s;
+  return `${s.slice(0, MAX_OUTPUT_BYTES)}\n[... truncated ${seen - MAX_OUTPUT_BYTES} bytes ...]`;
 }
 
 function signalToInt(sig: NodeJS.Signals): number {

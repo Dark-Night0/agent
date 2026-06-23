@@ -15,8 +15,8 @@ mkdir -p dist-bin
 
 TARGETS=(
   "bun-darwin-arm64:pentesterflow-darwin-arm64"
-  "bun-darwin-x64-baseline:pentesterflow-darwin-x64"
-  "bun-linux-x64-baseline:pentesterflow-linux-x64"
+  "bun-darwin-x64:pentesterflow-darwin-x64"
+  "bun-linux-x64:pentesterflow-linux-x64"
   "bun-linux-arm64:pentesterflow-linux-arm64"
 )
 

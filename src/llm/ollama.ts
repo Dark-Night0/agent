@@ -8,18 +8,9 @@
 
 import { warn } from '../logger/logger.js';
 import type { Client, Pinger, StreamingClient } from './client.js';
-import { type BackendError, classifyBackend, parseRetryAfter } from './errors.js';
+import { classifyBackend } from './errors.js';
 import { newCallID } from './ids.js';
-import { withRetry } from './retry.js';
-import type { ChatRequest, ChatResponse, FinishReason, Message, ToolCall } from './types.js';
-
-/** Annotate a backend error with the server's Retry-After so withRetry can
- *  honor it instead of its computed backoff. */
-function withRetryAfter(err: BackendError, resp: Response): BackendError {
-  const ms = parseRetryAfter(resp.headers.get('retry-after'));
-  if (ms !== undefined) err.retryAfterMs = ms;
-  return err;
-}
+import type { ChatRequest, ChatResponse, Message, ToolCall } from './types.js';
 
 interface OllamaToolCall {
   function: {
@@ -37,40 +28,15 @@ interface OllamaMessage {
 interface OllamaChatResp {
   message?: OllamaMessage;
   done?: boolean;
-  /** Why generation stopped: 'stop', 'length' (hit num_predict/num_ctx), ... */
-  done_reason?: string;
 }
-const CHAT_TIMEOUT_MS = 10 * 60 * 1000;
-// Floor for the context window when none is configured. Ollama silently
-// defaults to num_ctx=2048 and truncates input every turn; 8192 is a sane
-// minimum for agent histories. A probed/configured value overrides this.
-const OLLAMA_DEFAULT_NUM_CTX = 8192;
 
 export class OllamaClient implements Client, StreamingClient, Pinger {
   readonly baseURL: string;
   readonly modelID: string;
-  private numCtx?: number;
-  private readonly temperature?: number;
-  private readonly maxTokens?: number;
 
-  constructor(
-    baseURL: string,
-    model: string,
-    numCtx?: number,
-    genOpts: { temperature?: number; maxTokens?: number } = {},
-  ) {
+  constructor(baseURL: string, model: string) {
     this.baseURL = baseURL || 'http://localhost:11434';
     this.modelID = model;
-    this.numCtx = numCtx;
-    this.temperature = genOpts.temperature;
-    this.maxTokens = genOpts.maxTokens;
-  }
-
-  /** Apply the context window detected at startup (detectOllamaContextWindow).
-   *  Callers holding the client use this after the probe so the next request
-   *  stops silently truncating input at Ollama's 2048 default. */
-  setNumCtx(n: number): void {
-    if (Number.isFinite(n) && n > 0) this.numCtx = n;
   }
 
   name(): string {
@@ -94,45 +60,24 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
   }
 
   async chat(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
-    // Retry rate limits / transient 5xx with backoff (E7). The non-streaming
-    // call has no observable side effects before it returns, so re-running it
-    // wholesale is safe.
-    return withRetry(() => this.chatOnce(req, signal), { signal });
-  }
-
-  private async chatOnce(req: ChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
     const body = this.encodeRequest(req, false);
-    const { signal: combinedSignal, dispose } = withTimeout(signal, CHAT_TIMEOUT_MS);
+    let resp: Response;
     try {
-      let resp: Response;
-      try {
-        resp = await fetch(`${this.baseURL}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: combinedSignal,
-        });
-      } catch (err) {
-        throw classifyBackend('ollama', err, 0, undefined);
-      }
-      const raw = await resp.text();
-      if (resp.status !== 200) {
-        throw withRetryAfter(classifyBackend('ollama', null, resp.status, raw), resp);
-      }
-      let parsed: OllamaChatResp;
-      try {
-        parsed = JSON.parse(raw) as OllamaChatResp;
-      } catch {
-        throw classifyBackend('ollama', null, resp.status, `invalid JSON from ollama: ${raw}`);
-      }
-      return this.assembleResponse(
-        parsed.message ?? { role: 'assistant', content: '' },
-        req.tools,
-        parsed.done_reason,
-      );
-    } finally {
-      dispose();
+      resp = await fetch(`${this.baseURL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      throw classifyBackend('ollama', err, 0, undefined);
     }
+    const raw = await resp.text();
+    if (resp.status !== 200) {
+      throw classifyBackend('ollama', null, resp.status, raw);
+    }
+    const parsed = JSON.parse(raw) as OllamaChatResp;
+    return this.assembleResponse(parsed.message ?? { role: 'assistant', content: '' }, req.tools);
   }
 
   async chatStream(
@@ -140,110 +85,65 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     onDelta: (delta: string) => void,
     signal?: AbortSignal,
   ): Promise<ChatResponse> {
-    // Retry only the connection setup (E7): a transient 429/5xx surfaces before
-    // any delta is emitted, so re-opening can't double-emit tokens. Once the
-    // 200 stream is flowing, a mid-stream failure is NOT retried.
-    const { resp, dispose } = await withRetry(() => this.openStream(req, signal), { signal });
+    const body = this.encodeRequest(req, true);
+    let resp: Response;
+    try {
+      resp = await fetch(`${this.baseURL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      throw classifyBackend('ollama', err, 0, undefined);
+    }
+    if (resp.status !== 200) {
+      const raw = await resp.text();
+      throw classifyBackend('ollama', null, resp.status, raw);
+    }
     if (!resp.body) {
-      dispose();
       throw new Error('ollama: empty stream body');
     }
 
     let content = '';
     const toolCalls: OllamaToolCall[] = [];
     let skipped = 0;
-    let doneReason: string | undefined;
 
-    try {
-      for await (const line of iterLines(resp.body)) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let chunk: OllamaChatResp;
-        try {
-          chunk = JSON.parse(trimmed) as OllamaChatResp;
-        } catch (err) {
-          // Defensive logging. Drop the chunk but
-          // surface enough detail to diagnose vanished tool calls.
-          skipped += 1;
-          const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed;
-          warn('ollama: dropped malformed stream chunk', {
-            err: err instanceof Error ? err.message : String(err),
-            preview,
-            total_skipped: skipped,
-          });
-          continue;
-        }
-        if (chunk.message?.content) {
-          content += chunk.message.content;
-          onDelta(chunk.message.content);
-        }
-        if (chunk.message?.tool_calls?.length) {
-          toolCalls.push(...chunk.message.tool_calls);
-        }
-        if (chunk.done) {
-          doneReason = chunk.done_reason;
-          break;
-        }
-      }
-    } finally {
-      dispose();
-    }
-
-    return this.assembleResponse(
-      { role: 'assistant', content, tool_calls: toolCalls },
-      req.tools,
-      doneReason,
-    );
-  }
-
-  /** Open the streaming response and pair it with a `dispose` that cancels its
-   *  timeout, or throw a (retry-annotated) BackendError. Extracted so withRetry
-   *  can re-attempt setup without re-entering the consume loop; on success the
-   *  caller owns `dispose` and must call it once the stream is consumed. */
-  private async openStream(
-    req: ChatRequest,
-    signal?: AbortSignal,
-  ): Promise<{ resp: Response; dispose: () => void }> {
-    const body = this.encodeRequest(req, true);
-    const { signal: combinedSignal, dispose } = withTimeout(signal, CHAT_TIMEOUT_MS);
-    try {
-      let resp: Response;
+    for await (const line of iterLines(resp.body)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let chunk: OllamaChatResp;
       try {
-        resp = await fetch(`${this.baseURL}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: combinedSignal,
-        });
+        chunk = JSON.parse(trimmed) as OllamaChatResp;
       } catch (err) {
-        throw classifyBackend('ollama', err, 0, undefined);
+        // Defensive logging. Drop the chunk but
+        // surface enough detail to diagnose vanished tool calls.
+        skipped += 1;
+        const preview = trimmed.length > 200 ? `${trimmed.slice(0, 200)}…` : trimmed;
+        warn('ollama: dropped malformed stream chunk', {
+          err: err instanceof Error ? err.message : String(err),
+          preview,
+          total_skipped: skipped,
+        });
+        continue;
       }
-      if (resp.status !== 200) {
-        const raw = await resp.text();
-        throw withRetryAfter(classifyBackend('ollama', null, resp.status, raw), resp);
+      if (chunk.message?.content) {
+        content += chunk.message.content;
+        onDelta(chunk.message.content);
       }
-      return { resp, dispose };
-    } catch (err) {
-      // Failed attempt: clear its timer now so a retry doesn't leak it.
-      dispose();
-      throw err;
+      if (chunk.message?.tool_calls?.length) {
+        toolCalls.push(...chunk.message.tool_calls);
+      }
+      if (chunk.done) break;
     }
+
+    return this.assembleResponse({ role: 'assistant', content, tool_calls: toolCalls }, req.tools);
   }
 
   private encodeRequest(req: ChatRequest, stream: boolean) {
-    // Pin the context window so Ollama doesn't silently truncate at its 2048
-    // default. A probed/configured value wins; otherwise floor at 8192 (M-num_ctx).
-    // temperature / num_predict (max tokens) are forwarded only when the user
-    // configured them, so the model's own defaults apply otherwise.
-    const options: { num_ctx: number; temperature?: number; num_predict?: number } = {
-      num_ctx: this.numCtx ?? OLLAMA_DEFAULT_NUM_CTX,
-    };
-    if (this.temperature !== undefined) options.temperature = this.temperature;
-    if (this.maxTokens !== undefined && this.maxTokens > 0) options.num_predict = this.maxTokens;
     return {
       model: this.modelID,
       stream,
-      options,
       messages: req.messages.map((m) => {
         const out: OllamaMessage = { role: m.role, content: m.content };
         if (m.toolCalls?.length) {
@@ -272,11 +172,7 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     };
   }
 
-  private assembleResponse(
-    msg: OllamaMessage,
-    tools?: ChatRequest['tools'],
-    doneReason?: string,
-  ): ChatResponse {
+  private assembleResponse(msg: OllamaMessage, tools?: ChatRequest['tools']): ChatResponse {
     const out: Message = { role: 'assistant', content: msg.content ?? '' };
     const toolCalls = msg.tool_calls?.length
       ? msg.tool_calls
@@ -297,17 +193,9 @@ export class OllamaClient implements Client, StreamingClient, Pinger {
     }
     return {
       message: out,
-      finishReason: mapFinishReason(doneReason, Boolean(out.toolCalls?.length)),
+      finishReason: out.toolCalls?.length ? 'tool_calls' : 'stop',
     };
   }
-}
-
-/** Map Ollama's `done_reason` onto a FinishReason. A `length` truncation (hit
- *  num_predict / num_ctx) is surfaced so the agent can tell a capped turn from
- *  a clean one; otherwise tool calls win, then a plain stop. */
-function mapFinishReason(doneReason: string | undefined, hasToolCalls: boolean): FinishReason {
-  if (doneReason === 'length') return 'length';
-  return hasToolCalls ? 'tool_calls' : 'stop';
 }
 
 function parseContentToolCalls(content: string, knownTools: Set<string>): OllamaToolCall[] {
@@ -328,8 +216,49 @@ function parseJSONFromContent(content: string): unknown {
   try {
     return JSON.parse(candidate);
   } catch {
-    return undefined;
+    const sliced = sliceFirstJSONValue(candidate);
+    if (!sliced) return undefined;
+    try {
+      return JSON.parse(sliced);
+    } catch {
+      return undefined;
+    }
   }
+}
+
+function sliceFirstJSONValue(input: string): string | undefined {
+  const start = input.search(/[\[{]/);
+  if (start < 0) return undefined;
+
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < input.length; i += 1) {
+    const ch = input[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') stack.push('}');
+    if (ch === '[') stack.push(']');
+    if (ch === '}' || ch === ']') {
+      if (stack.pop() !== ch) return undefined;
+      if (stack.length === 0) return input.slice(start, i + 1);
+    }
+  }
+
+  return undefined;
 }
 
 function normalizeToolCalls(value: unknown, knownTools: Set<string>): OllamaToolCall[] {
@@ -417,44 +346,17 @@ async function* iterLines(body: ReadableStream<Uint8Array>): AsyncIterable<strin
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let idx = buffer.indexOf('\n');
-      while (idx >= 0) {
-        yield buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 1);
-        idx = buffer.indexOf('\n');
-      }
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx = buffer.indexOf('\n');
+    while (idx >= 0) {
+      yield buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 1);
+      idx = buffer.indexOf('\n');
     }
-    buffer += decoder.decode();
-    if (buffer.length > 0) yield buffer;
-  } finally {
-    await reader.cancel().catch(() => undefined);
   }
-}
-
-/** Build a per-request abort signal that fires when `parent` aborts OR after
- *  `ms`, paired with a `dispose` that clears the timer and detaches the
- *  listener. Replaces AbortSignal.timeout/any, whose 10-minute timers stay
- *  pending until they fire even after the request settles — leaking one timer
- *  per call. Call `dispose()` in a finally once the request is done. */
-function withTimeout(
-  parent: AbortSignal | undefined,
-  ms: number,
-): { signal: AbortSignal; dispose: () => void } {
-  const ctl = new AbortController();
-  const onAbort = () => ctl.abort();
-  if (parent?.aborted) ctl.abort();
-  else parent?.addEventListener('abort', onAbort, { once: true });
-  const timer = setTimeout(() => ctl.abort(), ms);
-  return {
-    signal: ctl.signal,
-    dispose: () => {
-      clearTimeout(timer);
-      parent?.removeEventListener('abort', onAbort);
-    },
-  };
+  buffer += decoder.decode();
+  if (buffer.length > 0) yield buffer;
 }

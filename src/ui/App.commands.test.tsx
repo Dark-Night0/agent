@@ -17,8 +17,6 @@ import { runSelfUpdate } from '../update/selfUpdate.js';
 import { App, type AppProps } from './App.js';
 import type { BannerData } from './Banner.js';
 import { TerminalSizeProvider } from './TerminalSize.js';
-import { EntryView } from './Transcript.js';
-import type { TranscriptEntry } from './state.js';
 
 vi.mock('../update/selfUpdate.js', () => ({
   runSelfUpdate: vi.fn(async () => ({
@@ -182,8 +180,6 @@ describe('UI slash commands (terminal integration)', () => {
     const frame = mounted.lastFrame() ?? '';
     expect(frame).toMatch(/backend|Ollama/i);
     expect(frame).toContain('Kimi');
-    expect(frame).toContain('OpenRouter');
-    expect(frame).toContain('DeepSeek');
     expect(runSpy).not.toHaveBeenCalled();
   });
 
@@ -334,105 +330,6 @@ describe('UI slash commands (terminal integration)', () => {
       model: 'models/gemini-flash-lite-latest',
       baseURL: 'https://generativelanguage.googleapis.com/v1beta',
       apiKey: 'gemini-test',
-    });
-    expect(runSpy).not.toHaveBeenCalled();
-  });
-
-  it('/provider can collect and test an OpenRouter API key before model selection', async () => {
-    vi.mocked(listModels).mockResolvedValueOnce(['openrouter/auto', 'anthropic/claude-sonnet-4.5']);
-    mounted = renderApp({
-      readConfig: () => ({ backend: 'ollama', baseURL: '', apiKey: '', model: 'stub-model' }),
-    });
-    await tick();
-    await submit(mounted.stdin, '/provider');
-
-    // Ollama→LM Studio→Kimi→Groq→Gemini→Claude→OpenRouter: 6 down-presses.
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\r');
-    await tick();
-
-    expect(mounted.lastFrame()).toContain('OpenRouter');
-    mounted.stdin.write('sk-or-test');
-    await tick();
-    mounted.stdin.write('\r');
-    await tick();
-
-    expect(listModels).toHaveBeenCalledWith(
-      'openrouter',
-      'https://openrouter.ai/api/v1',
-      'sk-or-test',
-    );
-    expect(mounted.lastFrame()).toContain('Select model for OpenRouter');
-    expect(mounted.lastFrame()).toContain('OpenRouter router');
-
-    mounted.stdin.write('\r');
-    await tick();
-    expect(applyProvider).toHaveBeenCalledWith({
-      backend: 'openrouter',
-      model: 'openrouter/auto',
-      baseURL: 'https://openrouter.ai/api/v1',
-      apiKey: 'sk-or-test',
-    });
-    expect(runSpy).not.toHaveBeenCalled();
-  });
-
-  it('/provider can collect and test a DeepSeek API key before model selection', async () => {
-    vi.mocked(listModels).mockResolvedValueOnce(['deepseek-v4-flash', 'deepseek-v4-pro']);
-    mounted = renderApp({
-      readConfig: () => ({ backend: 'ollama', baseURL: '', apiKey: '', model: 'stub-model' }),
-    });
-    await tick();
-    await submit(mounted.stdin, '/provider');
-
-    // Ollama→LM Studio→Kimi→Groq→Gemini→Claude→OpenRouter→DeepSeek: 7 down-presses.
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\x1B[B');
-    await tick();
-    mounted.stdin.write('\r');
-    await tick();
-
-    expect(mounted.lastFrame()).toContain('DeepSeek');
-    mounted.stdin.write('sk-deepseek-test');
-    await tick();
-    mounted.stdin.write('\r');
-    await tick();
-
-    expect(listModels).toHaveBeenCalledWith(
-      'deepseek',
-      'https://api.deepseek.com',
-      'sk-deepseek-test',
-    );
-    expect(mounted.lastFrame()).toContain('Select model for DeepSeek');
-
-    mounted.stdin.write('\r');
-    await tick();
-    expect(applyProvider).toHaveBeenCalledWith({
-      backend: 'deepseek',
-      model: 'deepseek-v4-flash',
-      baseURL: 'https://api.deepseek.com',
-      apiKey: 'sk-deepseek-test',
     });
     expect(runSpy).not.toHaveBeenCalled();
   });
@@ -607,34 +504,5 @@ describe('UI slash commands (terminal integration)', () => {
     expect(runSelfUpdate).toHaveBeenCalledWith('v0.1.0');
     expect(mounted.lastFrame()).toContain('update installed');
     expect(runSpy).not.toHaveBeenCalled();
-  });
-});
-
-describe('EntryView streaming vs committed rendering', () => {
-  // A streaming assistant entry renders in App's live frame on every token.
-  // The markdown/highlight pipeline must NOT run there (it re-runs over the
-  // whole accumulated answer per token); it runs once when the entry is
-  // finalized and committed to <Static>.
-  const entry: TranscriptEntry = {
-    kind: 'assistant',
-    text: 'Here is **bold** and `code`',
-    streaming: true,
-  };
-
-  it('renders the live (streaming) entry as plain text — no markdown pipeline', () => {
-    const { lastFrame } = render(<EntryView entry={entry} streaming />);
-    const frame = lastFrame() ?? '';
-    // Raw markdown markers survive verbatim because renderMarkdown is skipped.
-    expect(frame).toContain('**bold**');
-    expect(frame).toContain('`code`');
-  });
-
-  it('renders the committed (finalized) entry through the markdown pipeline', () => {
-    const { lastFrame } = render(<EntryView entry={{ ...entry, streaming: false }} />);
-    const frame = lastFrame() ?? '';
-    // renderMarkdown strips the ** / ` markers, styling the inner text instead.
-    expect(frame).toContain('bold');
-    expect(frame).not.toContain('**bold**');
-    expect(frame).not.toContain('`code`');
   });
 });

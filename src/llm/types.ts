@@ -13,11 +13,6 @@ export interface ToolCall {
   id: string;
   type: 'function';
   function: FunctionCall;
-  provider?: {
-    gemini?: {
-      thoughtSignature?: string;
-    };
-  };
 }
 
 export interface Message {
@@ -46,17 +41,9 @@ export interface ChatRequest {
   stream?: boolean;
 }
 
-/**
- * Why the model stopped. The well-known values are surfaced so callers can
- * distinguish a clean `stop` / `tool_calls` turn from a `length`-truncated one
- * (the backend hit max tokens / num_ctx). `(string & {})` keeps the union open
- * for backend-specific reasons we pass through verbatim.
- */
-export type FinishReason = 'stop' | 'length' | 'tool_calls' | (string & {});
-
 export interface ChatResponse {
   message: Message;
-  finishReason: FinishReason;
+  finishReason: string;
 }
 
 /**

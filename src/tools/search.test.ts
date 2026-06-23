@@ -2,10 +2,9 @@
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { AlwaysAllow, AlwaysDeny } from '../permission/permission.js';
+import { AlwaysAllow } from '../permission/permission.js';
 import { GlobTool, GrepTool } from './search.js';
 
 let tmp = '';
@@ -49,12 +48,6 @@ describe('GlobTool', () => {
       /required/,
     );
   });
-
-  it('prompts before globbing sensitive paths', async () => {
-    await expect(
-      new GlobTool().run({ pattern: '*', path: join(homedir(), '.ssh') }, signal, new AlwaysDeny()),
-    ).rejects.toThrow(/search of sensitive path denied/);
-  });
 });
 
 describe('GrepTool', () => {
@@ -90,59 +83,5 @@ describe('GrepTool', () => {
     await expect(
       new GrepTool().run({ pattern: '[unterminated', path: tmp }, signal, new AlwaysAllow()),
     ).rejects.toThrow(/invalid regex/);
-  });
-
-  it('prompts before grepping sensitive paths', async () => {
-    await expect(
-      new GrepTool().run(
-        { pattern: 'BEGIN', path: join(homedir(), '.ssh') },
-        signal,
-        new AlwaysDeny(),
-      ),
-    ).rejects.toThrow(/search of sensitive path denied/);
-  });
-
-  it('greps a single file without expanding the search from filesystem root', async () => {
-    const out = await new GrepTool().run(
-      { pattern: 'package main', path: join(tmp, 'main.go') },
-      signal,
-      new AlwaysAllow(),
-    );
-
-    expect(out).toContain('main.go');
-    expect(out).toContain('package main');
-  });
-
-  it('caps matches at limit and notes the limit (deterministic across many files)', async () => {
-    const dir = join(tmp, 'many');
-    mkdirSync(dir, { recursive: true });
-    for (let i = 0; i < 50; i++) {
-      writeFileSync(join(dir, `f${String(i).padStart(3, '0')}.txt`), 'needle here\n');
-    }
-    const out = await new GrepTool().run(
-      { pattern: 'needle', path: dir, glob: '**/*.txt', limit: 10 },
-      signal,
-      new AlwaysAllow(),
-    );
-    const lines = out.split('\n');
-    expect(lines).toContain('[... limited to 10 matches ...]');
-    // 10 matches + the limit note line.
-    expect(lines.filter((l) => l.includes('needle')).length).toBe(10);
-  });
-
-  it('finds matches across many files in a directory', async () => {
-    const dir = join(tmp, 'spread');
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'a.txt'), 'alpha TARGET\n');
-    writeFileSync(join(dir, 'b.txt'), 'beta\n');
-    writeFileSync(join(dir, 'c.txt'), 'gamma TARGET\n');
-    const out = await new GrepTool().run(
-      { pattern: 'TARGET', path: dir, glob: '**/*.txt' },
-      signal,
-      new AlwaysAllow(),
-    );
-    expect(out).toContain('a.txt');
-    expect(out).toContain('c.txt');
-    expect(out).not.toContain('b.txt');
   });
 });

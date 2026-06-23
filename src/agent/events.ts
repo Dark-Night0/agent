@@ -43,10 +43,6 @@ export interface SkillActiveEvent {
   type: 'skill-active';
   name: string;
 }
-export interface MemoryRecallEvent {
-  type: 'memory-recall';
-  names: string[];
-}
 export interface DoneEvent {
   type: 'done';
 }
@@ -60,7 +56,6 @@ export type AgentEvent =
   | CompactEvent
   | DecisionEvent
   | SkillActiveEvent
-  | MemoryRecallEvent
   | DoneEvent;
 
 /** MaxStepsError is the recognizable Error subtype raised when the tool

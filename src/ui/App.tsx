@@ -13,10 +13,6 @@ import { findActiveMention, listMentionDir, parseMentionPath } from '../agent/me
 import type { Backend } from '../config/config.js';
 import { listModels } from '../llm/models.js';
 import {
-  ANTHROPIC_DEFAULT_BASE_URL,
-  ANTHROPIC_RECOMMENDED_MODELS,
-  DEEPSEEK_DEFAULT_BASE_URL,
-  DEEPSEEK_MODELS,
   GEMINI_CHEAP_MODELS,
   GEMINI_DEFAULT_BASE_URL,
   GEMINI_RECOMMENDED_MODELS,
@@ -25,7 +21,6 @@ import {
   KIMI_DEFAULT_BASE_URL,
   KIMI_MODELS,
   OPENROUTER_DEFAULT_BASE_URL,
-  OPENROUTER_RECOMMENDED_MODELS,
 } from '../llm/providers.js';
 import type { SessionDebugLog } from '../logger/sessionDebug.js';
 import { renderSkillTemplate } from '../skills/template.js';
@@ -38,11 +33,10 @@ import { PermissionModal } from './PermissionModal.js';
 import { SecretInputModal, type SecretInputRequest } from './SecretInputModal.js';
 import { SkillsModal } from './SkillsModal.js';
 import { SlashMenu } from './SlashMenu.js';
-import { StatusBar, type StatusProps } from './StatusBar.js';
+import { StatusBar } from './StatusBar.js';
 import { useTerminalSize } from './TerminalSize.js';
 import { EntryView, Transcript } from './Transcript.js';
 import type { AskRequest } from './askBridge.js';
-import { chalkLevel } from './colorLevel.js';
 import { SLASH_ITEMS, filterSlash } from './slashItems.js';
 import type { Action, TranscriptEntry, TranscriptFilter } from './state.js';
 import { initialState, reducer } from './state.js';
@@ -109,9 +103,7 @@ export interface AppProps {
    *  it to surface "skill reloaded" without a modal. */
   bindNoticePublisher?: (publish: (text: string) => void) => void;
   /** Start the local Burp/PentesterFlow bridge on demand from /burp. */
-  startBurpBridge?: (
-    port?: number,
-  ) => Promise<{ url: string; token: string; alreadyRunning: boolean }>;
+  startBurpBridge?: (port?: number) => Promise<{ url: string; alreadyRunning: boolean }>;
   /** Optional recap inserted once when a saved session is resumed. */
   resumeSummary?: string;
 }
@@ -212,13 +204,6 @@ export function App({
       value: string,
       opts?: { transcriptUserText?: string; systemText?: string; runOptions?: AgentRunOptions },
     ) => {
-      if (agent.isRunning()) {
-        dispatch({
-          type: 'append',
-          entry: { kind: 'error', text: 'a turn is already running — cancel it with Esc first' },
-        });
-        return;
-      }
       sessionDebug?.write('turn_start', {
         prompt: value,
         transcript_user_text: opts?.transcriptUserText,
@@ -239,14 +224,6 @@ export function App({
         sessionDebug?.agentEvent(ev);
         if (ev.type === 'error' && isMaxStepsError(ev.err)) {
           const steps = ev.err.steps;
-          const rejectMaxSteps = () => {
-            dispatch({ type: 'set-ask', req: null });
-            dispatch({
-              type: 'append',
-              entry: { kind: 'system', text: 'stopped at max steps' },
-            });
-          };
-          ctl.signal.addEventListener('abort', rejectMaxSteps, { once: true });
           dispatch({
             type: 'append',
             entry: {
@@ -272,7 +249,6 @@ export function App({
                 ],
               },
               resolve: (label) => {
-                ctl.signal.removeEventListener('abort', rejectMaxSteps);
                 dispatch({ type: 'set-ask', req: null });
                 if (label === 'Continue') {
                   runAgentTurn('Continue from where you stopped and finish the current task.', {
@@ -286,8 +262,11 @@ export function App({
                 });
               },
               reject: () => {
-                ctl.signal.removeEventListener('abort', rejectMaxSteps);
-                rejectMaxSteps();
+                dispatch({ type: 'set-ask', req: null });
+                dispatch({
+                  type: 'append',
+                  entry: { kind: 'system', text: 'stopped at max steps' },
+                });
               },
             },
           });
@@ -349,7 +328,6 @@ export function App({
 
   useEffect(() => {
     const saveSnapshot = () => {
-      if (agent.isRunning()) return;
       if (snapshotSaving.current) return;
       snapshotSaving.current = true;
       void agent
@@ -370,10 +348,6 @@ export function App({
     const timer = setInterval(saveSnapshot, CONTEXT_SNAPSHOT_INTERVAL_MS);
     return () => clearInterval(timer);
   }, [agent, sessionDebug]);
-
-  // The 1s elapsed-time clock now lives in <ElapsedTimer> (below the
-  // render) so its per-second tick re-renders only the status line, not the
-  // whole App tree (Transcript, Input, menus). See ElapsedTimer.
 
   // Live terminal width via the TerminalSizeProvider mounted in
   // cli/index.ts. Subscribes to stdout `resize` so the layout reflows
@@ -417,17 +391,11 @@ export function App({
   // built-in commands. Disabled skills are excluded — re-enabling from
   // /skills brings them back into the menu. Computed eagerly (no memo)
   // because the live-reload watcher mutates the registry in place and
-  // we want every render to see the current set — but only when the input
-  // is actually a slash command. filterSlash returns [] for non-slash
-  // input regardless of extras, so building the skill list on every
-  // keystroke (the common case is plain prose) is pure waste; gate it
-  // behind the `/` prefix so typing prose never touches the registry.
-  const skillSlashItems = inputValue.startsWith('/')
-    ? agent.skills.listEnabled().map((s) => ({
-        name: `/${s.name}`,
-        description: `[skill] ${s.description.slice(0, 70)}${s.description.length > 70 ? '…' : ''}`,
-      }))
-    : [];
+  // we want every render to see the current set.
+  const skillSlashItems = agent.skills.listEnabled().map((s) => ({
+    name: `/${s.name}`,
+    description: `[skill] ${s.description.slice(0, 70)}${s.description.length > 70 ? '…' : ''}`,
+  }));
   const slashMatches = filterSlash(inputValue, skillSlashItems);
 
   // @file picker is shown when the active word starts with `@<partial>`.
@@ -473,41 +441,6 @@ export function App({
       // Reset navigation state — submitting always exits history mode.
       setHistoryIdx(null);
       historyDraft.current = '';
-
-      // `#text` quick-adds a durable memory fact (Claude-Code-style); `#!text`
-      // saves it to the personal scope instead of the project. The fact is in
-      // context on the very next turn — no agent round-trip.
-      if (agentValue.startsWith('#')) {
-        const personal = agentValue.startsWith('#!');
-        const text = agentValue.slice(personal ? 2 : 1).trim();
-        if (!text) {
-          dispatch({
-            type: 'append',
-            entry: {
-              kind: 'system',
-              text: 'usage: #<text to remember>  (or #!<text> for personal)',
-            },
-          });
-          return;
-        }
-        void agent
-          .addMemory({ text, scope: personal ? 'personal' : 'project' })
-          .then((fact) =>
-            dispatch({
-              type: 'append',
-              entry: fact
-                ? { kind: 'system', text: `remembered (${fact.scope}/${fact.type}): ${fact.name}` }
-                : { kind: 'error', text: 'memory not saved (empty after redaction or no store)' },
-            }),
-          )
-          .catch((err: unknown) =>
-            dispatch({
-              type: 'append',
-              entry: { kind: 'error', text: `memory save failed: ${String(err)}` },
-            }),
-          );
-        return;
-      }
 
       if (agentValue.startsWith('/')) {
         const handled = handleSlash(
@@ -789,39 +722,17 @@ export function App({
   // actively-streaming assistant entry (tail entry still flagged
   // `streaming`) renders in the live frame below, until 'done' finalizes
   // it and it joins the committed log.
-  // Derive the committed/live split + transcript-derived hints once per
-  // transcript or filter change rather than on every keystroke. App
-  // re-renders on each input change via useTextField, but none of these
-  // depend on the input value, so memoizing keeps typing cheap.
-  const { liveEntry, filteredCommitted, showLiveEntry, expandHint } = useMemo(() => {
+  const liveEntry = (() => {
     const last = state.transcript[state.transcript.length - 1];
-    const live = last && last.kind === 'assistant' && last.streaming ? last : null;
-    const committed = live ? state.transcript.slice(0, -1) : state.transcript;
-    return {
-      liveEntry: live,
-      filteredCommitted: filterTranscript(committed, state.transcriptFilter),
-      showLiveEntry: live ? transcriptEntryMatchesFilter(live, state.transcriptFilter) : false,
-      expandHint: state.transcript.some((e) => e.collapsible && !e.expanded),
-    };
-  }, [state.transcript, state.transcriptFilter]);
-
-  // Agent-derived status values for the StatusBar. These read live agent
-  // state (token estimate, memory item count, compact threshold, target)
-  // which can only change when the transcript grows or a turn starts/ends —
-  // never from typing — so key the memo on [transcript length, busy] to skip
-  // the work on every keystroke. The transcript length / busy keys are
-  // intentional cache-busters for agent's internal mutable state (which React
-  // can't observe), hence the suppression of the "extra dependency" lint.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: transcript.length + busy are deliberate cache-busters for agent's hidden mutable state
-  const statusInfo = useMemo(
-    () => ({
-      target: agent.target.baseURL() || agent.target.name(),
-      memoryItems: agent.getMemoryStats().items,
-      ctxTokens: agent.approxTokens(),
-      compactThreshold: agent.getAutoCompactThreshold(),
-    }),
-    [agent, state.transcript.length, state.busy],
-  );
+    return last && last.kind === 'assistant' && last.streaming ? last : null;
+  })();
+  const committed = liveEntry ? state.transcript.slice(0, -1) : state.transcript;
+  const filteredCommitted = filterTranscript(committed, state.transcriptFilter);
+  const showLiveEntry = liveEntry
+    ? transcriptEntryMatchesFilter(liveEntry, state.transcriptFilter)
+    : false;
+  const target = agent.target.baseURL() || agent.target.name();
+  const memoryStats = agent.getMemoryStats();
 
   return (
     <Box flexDirection="column" width={cols}>
@@ -832,7 +743,7 @@ export function App({
       />
       {liveEntry && showLiveEntry ? (
         <Box flexDirection="column">
-          <EntryView entry={liveEntry} streaming />
+          <EntryView entry={liveEntry} />
         </Box>
       ) : null}
       {secretInput ? (
@@ -859,52 +770,25 @@ export function App({
             <SlashMenu items={slashMatches} selected={slashIdx} />
           ) : null}
           <Input value={inputValue} cursor={input.cursor} disabled={state.busy} />
-          <ElapsedTimer
+          <StatusBar
             busy={state.busy}
             apiReady={state.apiReady}
             activeSkill={state.activeSkill}
             yolo={state.yolo}
-            ctxTokens={statusInfo.ctxTokens}
-            compactThreshold={statusInfo.compactThreshold}
-            memoryItems={statusInfo.memoryItems}
+            ctxTokens={agent.approxTokens()}
+            compactThreshold={agent.getAutoCompactThreshold()}
+            memoryItems={memoryStats.items}
             model={state.bannerData.model}
             toolSupport={state.bannerData.toolSupport}
             phase={state.phase}
             transcriptFilter={state.transcriptFilter}
-            target={statusInfo.target}
-            expandHint={expandHint}
-            runningTool={state.runningTool}
+            target={target}
+            expandHint={state.transcript.some((e) => e.collapsible && !e.expanded)}
           />
         </>
       )}
     </Box>
   );
-}
-
-// ---------- elapsed clock ----------
-
-/**
- * Owns the 1s busy-clock so its per-second tick re-renders only the status
- * line, not the whole App tree. A ticker runs only while the agent is busy,
- * so a long-running tool (a scan, a slow curl) shows a climbing timer instead
- * of an indistinguishable-from-a-hang spinner. All other StatusBar props are
- * forwarded unchanged; only `elapsedSeconds` is owned here.
- */
-function ElapsedTimer(props: Omit<StatusProps, 'elapsedSeconds'>): JSX.Element {
-  const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  useEffect(() => {
-    if (!props.busy) {
-      setElapsedSeconds(0);
-      return;
-    }
-    const start = Date.now();
-    setElapsedSeconds(0);
-    const id = setInterval(() => {
-      setElapsedSeconds(Math.floor((Date.now() - start) / 1000));
-    }, 1000);
-    return () => clearInterval(id);
-  }, [props.busy]);
-  return <StatusBar {...props} elapsedSeconds={elapsedSeconds} />;
 }
 
 // ---------- helpers ----------
@@ -969,7 +853,7 @@ function handleSlash(
   ) => void,
   runAgentCompact: () => void,
   startBurpBridge:
-    | ((port?: number) => Promise<{ url: string; token: string; alreadyRunning: boolean }>)
+    | ((port?: number) => Promise<{ url: string; alreadyRunning: boolean }>)
     | undefined,
 ): boolean {
   const [cmd, ...rest] = raw.trim().split(/\s+/);
@@ -1011,122 +895,12 @@ function handleSlash(
         entry: { kind: 'system', text: buildHelpText(agent, readConfig) },
       });
       return true;
-    case '/memory': {
-      const sub = (rest[0] ?? '').toLowerCase();
-      if (sub === 'clear') {
-        void agent.clearMemory().then(() =>
-          dispatch({
-            type: 'append',
-            entry: { kind: 'system', text: 'session memory cleared' },
-          }),
-        );
-        return true;
-      }
-      if (sub === 'forget') {
-        const query = rest.slice(1).join(' ').trim();
-        if (!query) {
-          dispatch({
-            type: 'append',
-            entry: { kind: 'error', text: 'usage: /memory forget <text>' },
-          });
-          return true;
-        }
-        void agent.forgetMemory(query).then((removed) =>
-          dispatch({
-            type: 'append',
-            entry: {
-              kind: 'system',
-              text: removed.length
-                ? `forgot ${removed.length} item${removed.length === 1 ? '' : 's'}:\n${removed.map((r) => `- ${r}`).join('\n')}`
-                : `no memory items matched "${query}"`,
-            },
-          }),
-        );
-        return true;
-      }
-      if (sub === 'add') {
-        const text = rest.slice(1).join(' ').trim();
-        if (!text) {
-          dispatch({
-            type: 'append',
-            entry: { kind: 'error', text: 'usage: /memory add <text>  (or use #<text>)' },
-          });
-          return true;
-        }
-        void agent
-          .addMemory({ text })
-          .then((fact) =>
-            dispatch({
-              type: 'append',
-              entry: fact
-                ? { kind: 'system', text: `remembered (${fact.scope}/${fact.type}): ${fact.name}` }
-                : { kind: 'error', text: 'memory not saved' },
-            }),
-          )
-          .catch((err: unknown) =>
-            dispatch({
-              type: 'append',
-              entry: { kind: 'error', text: `memory save failed: ${String(err)}` },
-            }),
-          );
-        return true;
-      }
-      if (sub === 'list') {
-        const facts = agent.listCuratedMemory();
-        dispatch({
-          type: 'append',
-          entry: {
-            kind: 'system',
-            text: facts.length
-              ? `Saved memory (${facts.length}):\n${facts.map((f) => `- [${f.type}] ${f.name} — ${f.description}`).join('\n')}`
-              : 'no saved memory yet — add one with #<text> or /memory add <text>',
-          },
-        });
-        return true;
-      }
-      if (sub === 'intel') {
-        const action = (rest[1] ?? 'stats').toLowerCase();
-        if (action === 'clear') {
-          const which = (rest[2] ?? 'all') as 'project' | 'personal' | 'all';
-          void agent.clearIntelligence(which).then(() =>
-            dispatch({
-              type: 'append',
-              entry: { kind: 'system', text: `intelligence cleared (${which})` },
-            }),
-          );
-          return true;
-        }
-        if (action === 'stats' || action === 'list') {
-          const s = agent.getIntelligenceStats();
-          dispatch({
-            type: 'append',
-            entry: {
-              kind: 'system',
-              text: `Intelligence (learned scenarios) — project: ${s.project} · personal: ${s.personal}\n(auto-capped + pruned to most recent per scope; use /memory intel clear [project|personal|all] to wipe)`,
-            },
-          });
-          return true;
-        }
-        dispatch({
-          type: 'append',
-          entry: {
-            kind: 'error',
-            text: 'usage: /memory intel [stats|clear [project|personal|all]]',
-          },
-        });
-        return true;
-      }
-      // Default view: durable curated facts first, then the session checkpoint.
-      const facts = agent.listCuratedMemory();
-      const curated = facts.length
-        ? `Saved memory (${facts.length}):\n${facts.map((f) => `- [${f.type}] ${f.name} — ${f.description}`).join('\n')}`
-        : 'No saved memory yet. Add one with #<text> or /memory add <text>.';
+    case '/memory':
       dispatch({
         type: 'append',
-        entry: { kind: 'system', text: `${curated}\n\n${agent.formatMemory()}` },
+        entry: { kind: 'system', text: agent.formatMemory() },
       });
       return true;
-    }
     case '/snapshot':
       void agent
         .saveContextSnapshot('manual /snapshot')
@@ -1167,8 +941,8 @@ function handleSlash(
             entry: {
               kind: 'system',
               text: result.alreadyRunning
-                ? `Burp bridge already listening at ${result.url}\nToken: ${result.token}`
-                : `Burp bridge listening at ${result.url}\nToken: ${result.token}`,
+                ? `Burp bridge already listening at ${result.url}`
+                : `Burp bridge listening at ${result.url}`,
             },
           }),
         )
@@ -1192,13 +966,6 @@ function handleSlash(
       return true;
     }
     case '/next': {
-      if (agent.isRunning()) {
-        dispatch({
-          type: 'append',
-          entry: { kind: 'error', text: 'next: a turn is already running' },
-        });
-        return true;
-      }
       const objective = rest.join(' ').trim();
       void agent
         .coverageContext(new AbortController().signal)
@@ -1407,14 +1174,10 @@ function backendLabel(backend: Backend): string {
       return 'Kimi';
     case 'groq':
       return 'Groq';
-    case 'openrouter':
-      return 'OpenRouter';
-    case 'deepseek':
-      return 'DeepSeek';
     case 'gemini':
       return 'Gemini';
-    case 'anthropic':
-      return 'Claude';
+    case 'openrouter':
+      return 'OpenRouter';
   }
 }
 
@@ -1623,20 +1386,14 @@ function handleSkillsCommand(
 // renders consistently regardless of the parent component's color
 // inference. The transcript's role-color wrapper doesn't strip embedded
 // ANSI, so accents survive into render.
-const helpChalk = new Chalk({ level: chalkLevel() });
+const helpChalk = new Chalk({ level: 3 });
 
 const KEYBINDINGS: Array<{ keys: string; desc: string }> = [
   { keys: '@<file>', desc: 'inline a file into the next turn (Tab opens a picker)' },
-  {
-    keys: '#<text>',
-    desc: 'remember a durable fact (#!<text> = personal); recalled automatically',
-  },
   { keys: '/', desc: 'open the slash-command menu' },
   { keys: '↑ / ↓', desc: 'walk session prompt history (on first / last line of input)' },
-  { keys: 'Ctrl-N / Ctrl-J', desc: 'insert a newline inside the input' },
-  { keys: 'Ctrl-A / Ctrl-E', desc: 'jump to start / end of the current line' },
+  { keys: 'Shift-Enter', desc: 'newline inside the input' },
   { keys: 'Ctrl-O', desc: 'reprint the latest truncated tool output in full' },
-  { keys: 'Ctrl-F', desc: 'cycle the transcript filter' },
   { keys: 'mouse wheel / scrollbar', desc: 'scroll the conversation (native terminal scrollback)' },
   { keys: 'Esc', desc: 'cancel an in-flight turn / clear the input draft' },
   { keys: 'Ctrl-C', desc: 'quit pentesterflow' },
@@ -1648,7 +1405,6 @@ const TIPS: string[] = [
   'read_payloads(skill="<name>") pulls curated wordlists from disk. Skills like ssti / jwt ship pre-canned payload files in their payloads/ directory.',
   "Disabled skills are hidden from the agent's system prompt entirely. Use /skills to flip a skill back on without restarting.",
   '/model list opens an interactive backend model picker; /model <id> validates against the live catalog and suggests the closest match on typo.',
-  '/memory intel stats shows learned background scenarios count; /memory intel clear wipes them (project/personal/all). Intelligence is auto-pruned but grows to the cap on long engagements.',
 ];
 
 function pad(s: string, n: number): string {
@@ -1751,8 +1507,6 @@ function openProviderPicker(
   const labelGroq = `Groq${cur.backend === 'groq' ? ' (current)' : ''}`;
   const labelGemini = `Gemini${cur.backend === 'gemini' ? ' (current)' : ''}`;
   const labelOpenRouter = `OpenRouter${cur.backend === 'openrouter' ? ' (current)' : ''}`;
-  const labelDeepSeek = `DeepSeek${cur.backend === 'deepseek' ? ' (current)' : ''}`;
-  const labelClaude = `Claude${cur.backend === 'anthropic' ? ' (current)' : ''}`;
 
   const req: AskRequest = {
     question: {
@@ -1774,16 +1528,8 @@ function openProviderPicker(
           description: 'remote — Gemini API with native tool calls',
         },
         {
-          label: labelClaude,
-          description: 'remote — api.anthropic.com Messages API with native tool calls',
-        },
-        {
           label: labelOpenRouter,
           description: 'remote — openrouter.ai OpenAI-compatible API',
-        },
-        {
-          label: labelDeepSeek,
-          description: 'remote — api.deepseek.com OpenAI-compatible API',
         },
         {
           label: labelOAI,
@@ -1805,11 +1551,7 @@ function openProviderPicker(
                 ? 'gemini'
                 : picked.startsWith('OpenRouter')
                   ? 'openrouter'
-                  : picked.startsWith('DeepSeek')
-                    ? 'deepseek'
-                    : picked.startsWith('Claude')
-                      ? 'anthropic'
-                      : 'openai-compat';
+                  : 'openai-compat';
       const config = readConfig();
       // For openai-compat we need URL + key already in config.
       if (backend === 'openai-compat' && (!config.baseURL || !config.apiKey)) {
@@ -1824,14 +1566,18 @@ function openProviderPicker(
         });
         return;
       }
-      if (backend === 'kimi' && (config.backend !== 'kimi' || !config.apiKey)) {
+      if (backend === 'kimi') {
+        const hasKey = config.backend === 'kimi' && !!config.apiKey;
         void promptSecret({
           header: 'Kimi API',
-          question: 'Enter Kimi API key (MOONSHOT_API_KEY)',
-          placeholder: 'sk-...',
+          question: hasKey
+            ? 'Enter Kimi API key (press Enter to keep existing key)'
+            : 'Enter Kimi API key (MOONSHOT_API_KEY)',
+          placeholder: hasKey ? '••••••••' : 'sk-...',
         })
           .then((apiKey) => {
-            if (!apiKey) {
+            const keyToUse = apiKey || (hasKey ? config.apiKey : '');
+            if (!keyToUse) {
               dispatch({
                 type: 'append',
                 entry: { kind: 'error', text: 'Kimi API key cannot be empty.' },
@@ -1843,7 +1589,7 @@ function openProviderPicker(
               config.backend === 'kimi'
                 ? config.baseURL || KIMI_DEFAULT_BASE_URL
                 : KIMI_DEFAULT_BASE_URL,
-              apiKey,
+              keyToUse,
               dispatch,
               applyProvider,
               { successText: (picked) => `provider set to Kimi · model ${picked}` },
@@ -1857,14 +1603,18 @@ function openProviderPicker(
           });
         return;
       }
-      if (backend === 'groq' && (config.backend !== 'groq' || !config.apiKey)) {
+      if (backend === 'groq') {
+        const hasKey = config.backend === 'groq' && !!config.apiKey;
         void promptSecret({
           header: 'Groq API',
-          question: 'Enter Groq API key (GROQ_API_KEY)',
-          placeholder: 'gsk_...',
+          question: hasKey
+            ? 'Enter Groq API key (press Enter to keep existing key)'
+            : 'Enter Groq API key (GROQ_API_KEY)',
+          placeholder: hasKey ? '••••••••' : 'gsk_...',
         })
           .then((apiKey) => {
-            if (!apiKey) {
+            const keyToUse = apiKey || (hasKey ? config.apiKey : '');
+            if (!keyToUse) {
               dispatch({
                 type: 'append',
                 entry: { kind: 'error', text: 'Groq API key cannot be empty.' },
@@ -1874,7 +1624,7 @@ function openProviderPicker(
             void fetchAndPickModel(
               backend,
               GROQ_DEFAULT_BASE_URL,
-              apiKey,
+              keyToUse,
               dispatch,
               applyProvider,
               { successText: (picked) => `provider set to Groq · model ${picked}` },
@@ -1888,45 +1638,18 @@ function openProviderPicker(
           });
         return;
       }
-      if (backend === 'gemini' && (config.backend !== 'gemini' || !config.apiKey)) {
+      if (backend === 'openrouter') {
+        const hasKey = config.backend === 'openrouter' && !!config.apiKey;
         void promptSecret({
-          header: 'Gemini API',
-          question: 'Enter Gemini API key (GEMINI_API_KEY)',
-          placeholder: 'AIza...',
+          header: 'OpenRouter API',
+          question: hasKey
+            ? 'Enter OpenRouter API key (press Enter to keep existing key)'
+            : 'Enter OpenRouter API key',
+          placeholder: hasKey ? '••••••••' : 'sk-or-v1-...',
         })
           .then((apiKey) => {
-            if (!apiKey) {
-              dispatch({
-                type: 'append',
-                entry: { kind: 'error', text: 'Gemini API key cannot be empty.' },
-              });
-              return;
-            }
-            void fetchAndPickModel(
-              backend,
-              GEMINI_DEFAULT_BASE_URL,
-              apiKey,
-              dispatch,
-              applyProvider,
-              { successText: (picked) => `provider set to Gemini · model ${picked}` },
-            );
-          })
-          .catch(() => {
-            dispatch({
-              type: 'append',
-              entry: { kind: 'system', text: 'Gemini setup cancelled.' },
-            });
-          });
-        return;
-      }
-      if (backend === 'openrouter' && (config.backend !== 'openrouter' || !config.apiKey)) {
-        void promptSecret({
-          header: 'OpenRouter',
-          question: 'Enter OpenRouter API key (OPENROUTER_API_KEY)',
-          placeholder: 'sk-or-...',
-        })
-          .then((apiKey) => {
-            if (!apiKey) {
+            const keyToUse = apiKey || (hasKey ? config.apiKey : '');
+            if (!keyToUse) {
               dispatch({
                 type: 'append',
                 entry: { kind: 'error', text: 'OpenRouter API key cannot be empty.' },
@@ -1935,8 +1658,10 @@ function openProviderPicker(
             }
             void fetchAndPickModel(
               backend,
-              OPENROUTER_DEFAULT_BASE_URL,
-              apiKey,
+              config.backend === 'openrouter'
+                ? config.baseURL || OPENROUTER_DEFAULT_BASE_URL
+                : OPENROUTER_DEFAULT_BASE_URL,
+              keyToUse,
               dispatch,
               applyProvider,
               { successText: (picked) => `provider set to OpenRouter · model ${picked}` },
@@ -1950,96 +1675,42 @@ function openProviderPicker(
           });
         return;
       }
-      if (backend === 'deepseek' && (config.backend !== 'deepseek' || !config.apiKey)) {
+      if (backend === 'gemini') {
+        const hasKey = config.backend === 'gemini' && !!config.apiKey;
         void promptSecret({
-          header: 'DeepSeek',
-          question: 'Enter DeepSeek API key (DEEPSEEK_API_KEY)',
-          placeholder: 'sk-...',
+          header: 'Gemini API',
+          question: hasKey
+            ? 'Enter Gemini API key (press Enter to keep existing key)'
+            : 'Enter Gemini API key (GEMINI_API_KEY)',
+          placeholder: hasKey ? '••••••••' : 'AIza...',
         })
           .then((apiKey) => {
-            if (!apiKey) {
+            const keyToUse = apiKey || (hasKey ? config.apiKey : '');
+            if (!keyToUse) {
               dispatch({
                 type: 'append',
-                entry: { kind: 'error', text: 'DeepSeek API key cannot be empty.' },
+                entry: { kind: 'error', text: 'Gemini API key cannot be empty.' },
               });
               return;
             }
             void fetchAndPickModel(
               backend,
-              DEEPSEEK_DEFAULT_BASE_URL,
-              apiKey,
+              GEMINI_DEFAULT_BASE_URL,
+              keyToUse,
               dispatch,
               applyProvider,
-              { successText: (picked) => `provider set to DeepSeek · model ${picked}` },
+              { successText: (picked) => `provider set to Gemini · model ${picked}` },
             );
           })
           .catch(() => {
             dispatch({
               type: 'append',
-              entry: { kind: 'system', text: 'DeepSeek setup cancelled.' },
+              entry: { kind: 'system', text: 'Gemini setup cancelled.' },
             });
           });
         return;
       }
-      if (backend === 'anthropic' && (config.backend !== 'anthropic' || !config.apiKey)) {
-        void promptSecret({
-          header: 'Claude API',
-          question: 'Enter Anthropic API key (ANTHROPIC_API_KEY)',
-          placeholder: 'sk-ant-...',
-        })
-          .then((apiKey) => {
-            if (!apiKey) {
-              dispatch({
-                type: 'append',
-                entry: { kind: 'error', text: 'Anthropic API key cannot be empty.' },
-              });
-              return;
-            }
-            void fetchAndPickModel(
-              backend,
-              ANTHROPIC_DEFAULT_BASE_URL,
-              apiKey,
-              dispatch,
-              applyProvider,
-              { successText: (picked) => `provider set to Claude · model ${picked}` },
-            );
-          })
-          .catch(() => {
-            dispatch({
-              type: 'append',
-              entry: { kind: 'system', text: 'Claude setup cancelled.' },
-            });
-          });
-        return;
-      }
-      const baseURL =
-        backend === 'openai-compat'
-          ? config.baseURL
-          : backend === 'kimi'
-            ? config.backend === 'kimi'
-              ? config.baseURL || KIMI_DEFAULT_BASE_URL
-              : KIMI_DEFAULT_BASE_URL
-            : backend === 'groq'
-              ? config.backend === 'groq'
-                ? config.baseURL || GROQ_DEFAULT_BASE_URL
-                : GROQ_DEFAULT_BASE_URL
-              : backend === 'gemini'
-                ? config.backend === 'gemini'
-                  ? config.baseURL || GEMINI_DEFAULT_BASE_URL
-                  : GEMINI_DEFAULT_BASE_URL
-                : backend === 'openrouter'
-                  ? config.backend === 'openrouter'
-                    ? config.baseURL || OPENROUTER_DEFAULT_BASE_URL
-                    : OPENROUTER_DEFAULT_BASE_URL
-                  : backend === 'deepseek'
-                    ? config.backend === 'deepseek'
-                      ? config.baseURL || DEEPSEEK_DEFAULT_BASE_URL
-                      : DEEPSEEK_DEFAULT_BASE_URL
-                    : backend === 'anthropic'
-                      ? config.backend === 'anthropic'
-                        ? config.baseURL || ANTHROPIC_DEFAULT_BASE_URL
-                        : ANTHROPIC_DEFAULT_BASE_URL
-                      : '';
+      const baseURL = backend === 'openai-compat' ? config.baseURL : '';
       const apiKey = backend === 'openai-compat' || config.backend === backend ? config.apiKey : '';
       void fetchAndPickModel(backend, baseURL, apiKey, dispatch, applyProvider);
     },
@@ -2161,14 +1832,9 @@ function modelDescription(
   if (currentModel && model === currentModel) parts.push('current / used before');
   if (backend === 'kimi' && KIMI_MODELS.includes(model)) parts.push('Kimi/Moonshot');
   if (backend === 'groq' && GROQ_MODELS.includes(model)) parts.push('Groq');
-  if (backend === 'openrouter' && OPENROUTER_RECOMMENDED_MODELS.includes(model)) {
-    parts.push('OpenRouter router');
-  }
-  if (backend === 'deepseek' && DEEPSEEK_MODELS.includes(model)) parts.push('DeepSeek');
   if (backend === 'gemini') {
     if (GEMINI_CHEAP_MODELS.includes(model)) parts.push('cheap cost');
     else if (GEMINI_RECOMMENDED_MODELS.includes(model)) parts.push('best fit');
   }
-  if (backend === 'anthropic' && ANTHROPIC_RECOMMENDED_MODELS.includes(model)) parts.push('Claude');
   return parts.length > 0 ? parts.join(' · ') : undefined;
 }

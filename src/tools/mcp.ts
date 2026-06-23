@@ -14,11 +14,6 @@ import type { Tool } from './types.js';
 
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const CLOSE_DEADLINE_MS = 3_000;
-const MCP_RESULT_CHAR_CAP = 128 * 1024;
-// Per-call deadline. The MCP SDK applies a 60s default request timeout, but we
-// set an explicit 120s ceiling so a stuck server (e.g. Browser MCP waiting on a
-// tab) can't hang a tool call indefinitely if that default is ever overridden.
-const MCP_CALL_TIMEOUT_MS = 120_000;
 
 export class MCPSession {
   readonly serverName: string;
@@ -85,10 +80,7 @@ export class MCPSession {
     signal?: AbortSignal,
   ): Promise<{ isError: boolean; content: unknown }> {
     if (this.closed) throw new Error(`mcp session ${this.serverName} is closed`);
-    const result = await this.client.callTool({ name, arguments: args }, undefined, {
-      signal,
-      timeout: MCP_CALL_TIMEOUT_MS,
-    });
+    const result = await this.client.callTool({ name, arguments: args }, undefined, { signal });
     return {
       isError: Boolean(result.isError),
       content: result.content,
@@ -175,56 +167,12 @@ export class MCPTool implements Tool {
 
   async run(args: Record<string, unknown>, signal: AbortSignal, _p: Prompter): Promise<string> {
     const result = await this.session.callTool(this.remoteName, args, signal);
+    const body = JSON.stringify(result.content, null, 2);
     if (result.isError) {
       throw new Error(formatMCPError(this.toolName, this.remoteName, result.content));
     }
-    // Bound the content BEFORE the pretty-print so a hostile/compromised server's
-    // oversized text block isn't first expanded into an even larger indented
-    // string (M10). The MCP SDK still buffers the raw transport message itself —
-    // a true byte cap would need transport-level support it doesn't expose — but
-    // this stops the secondary doubling and caps the block count.
-    const bounded = boundContent(result.content, MCP_RESULT_CHAR_CAP);
-    return truncateString(JSON.stringify(bounded), MCP_RESULT_CHAR_CAP);
+    return body;
   }
-}
-
-const MCP_MAX_CONTENT_BLOCKS = 200;
-// Cap recursion so a deeply nested (or self-referential-looking) content tree
-// from a hostile/buggy server can't blow the stack before the char cap applies.
-const MCP_MAX_DEPTH = 32;
-
-/** Recursively cap string fields and array lengths in MCP content so the
- *  downstream JSON.stringify can't allocate an unbounded string. */
-function boundContent(content: unknown, cap: number, depth = 0): unknown {
-  if (depth >= MCP_MAX_DEPTH) {
-    if (typeof content === 'string') return content.length > cap ? content.slice(0, cap) : content;
-    if (content && typeof content === 'object') return '[... max depth exceeded ...]';
-    return content;
-  }
-  if (typeof content === 'string') return content.length > cap ? content.slice(0, cap) : content;
-  if (Array.isArray(content)) {
-    const head = content
-      .slice(0, MCP_MAX_CONTENT_BLOCKS)
-      .map((b) => boundContent(b, cap, depth + 1));
-    if (content.length > MCP_MAX_CONTENT_BLOCKS) {
-      head.push({
-        type: 'text',
-        text: `[... ${content.length - MCP_MAX_CONTENT_BLOCKS} more content blocks truncated ...]`,
-      });
-    }
-    return head;
-  }
-  if (content && typeof content === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(content)) out[k] = boundContent(v, cap, depth + 1);
-    return out;
-  }
-  return content;
-}
-
-function truncateString(s: string, cap: number): string {
-  if (s.length <= cap) return s;
-  return `${s.slice(0, cap)}\n[... truncated ${s.length - cap} chars ...]`;
 }
 
 function formatMCPError(toolName: string, remoteName: string, content: unknown): string {

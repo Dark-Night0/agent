@@ -11,8 +11,6 @@ import type { ChatRequest } from './types.js';
 let server: Server;
 let baseURL = '';
 let lastBody: Record<string, unknown> | null = null;
-let lastHeaders: Record<string, string | string[] | undefined> | null = null;
-let proxyRateLimitCalls = 0;
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -35,7 +33,6 @@ beforeAll(async () => {
         stream?: boolean;
       };
       lastBody = body as Record<string, unknown>;
-      lastHeaders = req.headers;
 
       if (body.stream) {
         // SSE stream that fragments a tool call across two events, with
@@ -63,26 +60,6 @@ beforeAll(async () => {
               },
             ],
           });
-          send({ choices: [{ delta: {}, finish_reason: 'stop' }] });
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        }
-        if (body.model === 'partial-stop-eos') {
-          // A partial stop token at the very end that never completes — it must
-          // be flushed (it was real text, not a leaked role marker).
-          send({ choices: [{ delta: { content: 'Hello <|us' } }] });
-          send({ choices: [{ delta: {}, finish_reason: 'stop' }] });
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        }
-        if (body.model === 'reasoning-stream') {
-          // Reasoning model: chain-of-thought streams first, then the answer.
-          send({ choices: [{ delta: { reasoning_content: 'Let me think… ' } }] });
-          send({ choices: [{ delta: { reasoning_content: 'checking the target.' } }] });
-          send({ choices: [{ delta: { content: 'The answer ' } }] });
-          send({ choices: [{ delta: { content: 'is 42.' } }] });
           send({ choices: [{ delta: {}, finish_reason: 'stop' }] });
           res.write('data: [DONE]\n\n');
           res.end();
@@ -122,23 +99,6 @@ beforeAll(async () => {
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      if (body.model === 'proxy-200-ratelimit') {
-        // Proxy surfaces a transient rate limit inside an HTTP 200 on the first
-        // call, then succeeds — exercises the retryable-200-body path.
-        proxyRateLimitCalls += 1;
-        if (proxyRateLimitCalls === 1) {
-          res.end(JSON.stringify({ error: { message: 'Rate limit exceeded, please retry' } }));
-        } else {
-          res.end(
-            JSON.stringify({
-              choices: [
-                { message: { role: 'assistant', content: 'recovered' }, finish_reason: 'stop' },
-              ],
-            }),
-          );
-        }
-        return;
-      }
       if (body.model === 'glm-leak') {
         res.end(
           JSON.stringify({
@@ -202,21 +162,6 @@ describe('OpenAIClient', () => {
     expect(out.finishReason).toBe('stop');
   });
 
-  it('streams reasoning_content as visible deltas but excludes it from the message', async () => {
-    const c = new OpenAIClient(baseURL, '', 'reasoning-stream');
-    const deltas: string[] = [];
-    const out = await c.chatStream(
-      { model: 'reasoning-stream', messages: [{ role: 'user', content: 'go' }] },
-      (d) => deltas.push(d),
-    );
-    // Reasoning is surfaced live (so the UI leaves the "planning" phase)…
-    expect(deltas.join('')).toContain('Let me think…');
-    expect(deltas.join('')).toContain('The answer is 42.');
-    // …but the returned message — which re-enters history — is answer-only.
-    expect(out.message.content).toBe('The answer is 42.');
-    expect(out.message.content).not.toContain('Let me think');
-  });
-
   it('streaming reassembles a fragmented tool call across SSE events', async () => {
     const c = new OpenAIClient(baseURL, '', 'qwen-coder');
     const deltas: string[] = [];
@@ -230,29 +175,6 @@ describe('OpenAIClient', () => {
     expect(out.message.toolCalls?.[0]?.function.name).toBe('http');
     expect(out.message.toolCalls?.[0]?.function.arguments).toBe('{"url":"https://x.example.com"}');
     expect(out.finishReason).toBe('tool_calls');
-  });
-
-  it('flushes a withheld partial stop token when the stream ends without completing it', async () => {
-    const c = OpenAIClient.lmStudio(baseURL, 'partial-stop-eos');
-    const deltas: string[] = [];
-    const out = await c.chatStream(
-      { model: 'partial-stop-eos', messages: [{ role: 'user', content: 'hi' }] },
-      (d) => deltas.push(d),
-    );
-    // "<|us" looked like the head of <|user|> mid-stream so it was withheld,
-    // but the stream ended — so it's emitted verbatim rather than dropped.
-    expect(deltas.join('')).toBe('Hello <|us');
-    expect(out.message.content).toBe('Hello <|us');
-  });
-
-  it('retries a proxy that returns a transient rate limit inside a 200 body', async () => {
-    const c = new OpenAIClient(baseURL, 'sk', 'proxy-200-ratelimit', 'openrouter');
-    const out = await c.chat({
-      model: 'proxy-200-ratelimit',
-      messages: [{ role: 'user', content: 'hi' }],
-    });
-    expect(out.message.content).toBe('recovered');
-    expect(proxyRateLimitCalls).toBe(2);
   });
 
   it('lmStudio factory uses the right default URL', () => {
@@ -270,61 +192,6 @@ describe('OpenAIClient', () => {
     const c = new OpenAIClient(baseURL, 'sk-kimi', 'kimi-k2.6', 'kimi');
     await c.chat({ model: 'kimi-k2.6', messages: [{ role: 'user', content: 'hi' }] });
     expect(lastBody?.thinking).toEqual({ type: 'disabled' });
-  });
-
-  it('does not send Kimi thinking toggle to Moonshot v1 models', async () => {
-    const c = new OpenAIClient(baseURL, 'sk-kimi', 'moonshot-v1-8k', 'kimi');
-    await c.chat({ model: 'moonshot-v1-8k', messages: [{ role: 'user', content: 'hi' }] });
-    expect(lastBody?.thinking).toBeUndefined();
-  });
-
-  it('sends a configured temperature to models that accept it', async () => {
-    const c = new OpenAIClient(
-      baseURL,
-      '',
-      'qwen-coder',
-      'openai-compat',
-      {},
-      { temperature: 0.3 },
-    );
-    await c.chat({ model: 'qwen-coder', messages: [{ role: 'user', content: 'hi' }] });
-    expect(lastBody?.temperature).toBe(0.3);
-  });
-
-  it('omits temperature for temperature-locked Kimi models but still caps tokens', async () => {
-    const c = new OpenAIClient(
-      baseURL,
-      'sk',
-      'kimi-k2.6',
-      'kimi',
-      {},
-      { temperature: 0.3, maxTokens: 2048 },
-    );
-    await c.chat({ model: 'kimi-k2.6', messages: [{ role: 'user', content: 'hi' }] });
-    // k2.6 rejects temperature != 1, so we must not send it…
-    expect(lastBody?.temperature).toBeUndefined();
-    // …but the response cap still applies using Kimi's preferred parameter.
-    expect(lastBody?.max_completion_tokens).toBe(2048);
-    expect(lastBody?.max_tokens).toBeUndefined();
-  });
-
-  it('does not send temperature or max_tokens when unconfigured', async () => {
-    const c = new OpenAIClient(baseURL, '', 'qwen-coder');
-    await c.chat({ model: 'qwen-coder', messages: [{ role: 'user', content: 'hi' }] });
-    expect(lastBody?.temperature).toBeUndefined();
-    expect(lastBody?.max_tokens).toBeUndefined();
-  });
-
-  it('sends provider-specific extra headers', async () => {
-    const c = new OpenAIClient(baseURL, 'sk-or', 'openrouter/auto', 'openrouter', {
-      'HTTP-Referer': 'https://github.com/pentesterflow/agent',
-      'X-OpenRouter-Title': 'PentesterFlow',
-    });
-    await c.chat({ model: 'openrouter/auto', messages: [{ role: 'user', content: 'hi' }] });
-
-    expect(lastHeaders?.['http-referer']).toBe('https://github.com/pentesterflow/agent');
-    expect(lastHeaders?.['x-openrouter-title']).toBe('PentesterFlow');
-    expect(lastHeaders?.authorization).toBe('Bearer sk-or');
   });
 
   it('adds LM Studio stop tokens and trims leaked chat-template roles', async () => {

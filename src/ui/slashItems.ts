@@ -17,11 +17,7 @@ export const SLASH_ITEMS: SlashItem[] = [
   { name: '/plan', args: '[objective]', description: 'plan-only mode without tools' },
   { name: '/next', args: '[objective]', description: 'coverage-driven next test suggestions' },
   { name: '/compact', description: 'summarize conversation into persistent session memory' },
-  {
-    name: '/memory',
-    args: '[add <text>|list|forget <text>|clear]',
-    description: 'saved + session memory; add/list curated facts (or #<text>), forget/clear',
-  },
+  { name: '/memory', description: 'show the current persistent session memory snapshot' },
   { name: '/snapshot', description: 'write the current redacted context snapshot now' },
   { name: '/burp', args: '[port]', description: 'start the local Burp/PentesterFlow listener' },
   { name: '/clear', description: 'clear the on-screen transcript only' },

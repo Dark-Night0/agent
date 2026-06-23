@@ -3,7 +3,6 @@
 
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
-import { memo } from 'react';
 import type { ToolSupportPill } from './Banner.js';
 import type { TranscriptFilter, UiPhase } from './state.js';
 
@@ -24,18 +23,6 @@ export interface StatusProps {
   target?: string;
   /** True when a collapsible tool-result hasn't been expanded yet (Ctrl-O reprints it). */
   expandHint: boolean;
-  /** Display label of the tool currently executing (shown while busy). */
-  runningTool?: string | null;
-  /** Whole seconds the current turn has been running (drives the busy clock). */
-  elapsedSeconds?: number;
-}
-
-/** mm:ss elapsed clock. 42 → "0:42", 125 → "2:05", 3700 → "61:40". */
-export function formatElapsed(totalSeconds: number): string {
-  const s = Math.max(0, Math.floor(totalSeconds));
-  const mins = Math.floor(s / 60);
-  const secs = s % 60;
-  return `${mins}:${String(secs).padStart(2, '0')}`;
 }
 
 function toolPill(t?: ToolSupportPill): { text: string; color: string } | null {
@@ -51,62 +38,20 @@ function toolPill(t?: ToolSupportPill): { text: string; color: string } | null {
   }
 }
 
-// Color for the SuperMode (skip-permissions) badge — an amber that reads as
-// "armed" without the alarm of error-red (degrades to plain under NO_COLOR).
-const SUPERMODE_COLOR = '#ff8700';
-
-// Right-aligned "armed" badge shown whenever YOLO is on, in every phase.
-function superMode(props: StatusProps): React.ReactElement | null {
-  return props.yolo ? (
-    <Text color={SUPERMODE_COLOR} bold>
-      SuperMode
-    </Text>
-  ) : null;
-}
-
-function StatusBarInner(props: StatusProps): React.ReactElement {
-  // Status content on the left, SuperMode pinned to the right edge of the
-  // terminal via space-between. When YOLO is off the right slot is empty and
-  // the status simply left-aligns.
-  return (
-    <Box width="100%" justifyContent="space-between">
-      {props.busy ? busyLine(props) : idleLine(props)}
-      {superMode(props)}
-    </Box>
-  );
-}
-
-// memo() with a shallow prop compare: App re-renders on every keystroke, but
-// the status props are stable between keystrokes (the agent.* status values
-// are memoized in App, and the elapsed clock is owned by ElapsedTimer), so
-// typing skips the StatusBar render entirely. The clock tick still re-renders
-// it (elapsedSeconds changes), which is exactly the one update we want.
-export const StatusBar = memo(StatusBarInner);
-
-function busyLine(props: StatusProps): React.ReactElement {
+export function StatusBar(props: StatusProps): React.ReactElement {
   const phaseText = phaseLabel(props.phase);
-  // While a tool runs, name the tool instead of the generic phase so a
-  // long scan/curl is identifiable; otherwise show the phase word. The
-  // elapsed clock makes a slow tool distinguishable from a hang.
-  const label = props.phase === 'running-tool' && props.runningTool ? props.runningTool : phaseText;
-  const clock = props.elapsedSeconds ? ` · ${formatElapsed(props.elapsedSeconds)}` : '';
-  return (
-    <Box>
-      <Text color="yellow">
-        <Spinner type="dots" />
-      </Text>
-      <Text color="gray">
-        {' '}
-        {label}
-        {clock} · Esc to cancel
-      </Text>
-      {props.activeSkill ? <Text color="gray"> · skill: {props.activeSkill}</Text> : null}
-    </Box>
-  );
-}
+  if (props.busy) {
+    return (
+      <Box>
+        <Text color="yellow">
+          <Spinner type="dots" />
+        </Text>
+        <Text color="gray"> {phaseText} · Esc to cancel</Text>
+        {props.activeSkill ? <Text color="gray"> · skill: {props.activeSkill}</Text> : null}
+      </Box>
+    );
+  }
 
-function idleLine(props: StatusProps): React.ReactElement {
-  const phaseText = phaseLabel(props.phase);
   const ctxHint =
     props.ctxTokens >= 1000
       ? `  ·  ctx: ~${(props.ctxTokens / 1000).toFixed(1)}k`
@@ -146,6 +91,11 @@ function idleLine(props: StatusProps): React.ReactElement {
         </Text>
       ) : null}
       {props.memoryItems > 0 ? <Text color="gray"> · mem: {props.memoryItems}</Text> : null}
+      {props.yolo ? (
+        <Text color="red" bold>
+          {'  ·  YOLO'}
+        </Text>
+      ) : null}
     </Box>
   );
 }

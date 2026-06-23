@@ -3,62 +3,12 @@
 // parses the top results.
 
 import type { Prompter } from '../permission/permission.js';
-import { gatePrivateRequest, parseHTTPURL } from './privateHost.js';
 import { type Tool, argString } from './types.js';
 
 const FETCH_TIMEOUT_MS = 30 * 1000;
 const FETCH_BODY_CAP = 512 * 1024;
 const SEARCH_BODY_CAP = 1024 * 1024;
 const FETCH_TEXT_CAP = 40 * 1024;
-// Cap the raw HTML fed to the regex passes below. stripHTML runs 5 global
-// regexes (some with `[\s\S]*?`) which are vulnerable to catastrophic
-// backtracking on pathological markup; bounding the input keeps the worst case
-// linear-ish. The downstream FETCH_TEXT_CAP (40KB) means text past this point
-// would be discarded anyway.
-const STRIP_INPUT_CAP = 256 * 1024;
-
-// Small TTL + LRU cache so repeated web_fetch/web_search calls (the model often
-// re-fetches the same advisory or re-runs a query) skip the network round-trip.
-// Only successful results are cached. Keyed by `fetch:<url>` / `search:<query>`.
-const CACHE_TTL_MS = 10 * 60 * 1000;
-const CACHE_MAX_ENTRIES = 50;
-
-interface CacheEntry {
-  value: string;
-  expires: number;
-}
-
-let resultCache = new Map<string, CacheEntry>();
-
-function cacheGet(key: string): string | undefined {
-  const entry = resultCache.get(key);
-  if (!entry) return undefined;
-  if (Date.now() > entry.expires) {
-    resultCache.delete(key);
-    return undefined;
-  }
-  // Re-insert so the most-recently-used key moves to the end (Map preserves
-  // insertion order; eviction drops from the front).
-  resultCache.delete(key);
-  resultCache.set(key, entry);
-  return entry.value;
-}
-
-function cacheSet(key: string, value: string): void {
-  resultCache.delete(key);
-  resultCache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
-  while (resultCache.size > CACHE_MAX_ENTRIES) {
-    const oldest = resultCache.keys().next().value;
-    if (oldest === undefined) break;
-    resultCache.delete(oldest);
-  }
-}
-
-/** Reset the web result cache. Exposed for tests so cached entries don't leak
- *  between cases (and so suites can exercise the cold path deterministically). */
-export function clearWebCache(): void {
-  resultCache = new Map<string, CacheEntry>();
-}
 
 const TAG_RE = /<[^>]+>/g;
 const SCRIPT_RE = /<script[^>]*>[\s\S]*?<\/script>/gi;
@@ -67,8 +17,7 @@ const WS_RE = /[ \t]+/g;
 const NL_RE = /\n{3,}/g;
 
 function stripHTML(s: string): string {
-  const input = s.length > STRIP_INPUT_CAP ? s.slice(0, STRIP_INPUT_CAP) : s;
-  return input
+  return s
     .replace(SCRIPT_RE, '')
     .replace(STYLE_RE, '')
     .replace(TAG_RE, '')
@@ -97,17 +46,9 @@ export class WebFetchTool implements Tool {
     return false;
   }
 
-  async run(args: Record<string, unknown>, signal: AbortSignal, p: Prompter): Promise<string> {
+  async run(args: Record<string, unknown>, signal: AbortSignal, _p: Prompter): Promise<string> {
     const url = argString(args, 'url');
     if (!url) throw new Error('url is required');
-    const parsed = parseHTTPURL(url);
-    const privateReason = await gatePrivateRequest(p, parsed, signal, 'web_fetch');
-
-    // Cache-check after the private-host gate so a repeat private fetch still
-    // re-prompts rather than silently replaying a cached body.
-    const cacheKey = `fetch:${parsed.toString()}`;
-    const cached = cacheGet(cacheKey);
-    if (cached !== undefined) return cached;
 
     const inner = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     const combined = anySignal(signal, inner);
@@ -116,7 +57,6 @@ export class WebFetchTool implements Tool {
     try {
       resp = await fetch(url, {
         method: 'GET',
-        redirect: 'manual',
         headers: {
           Accept: 'text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8',
           'User-Agent': 'Mozilla/5.0 pentesterflow/0.1 (+research)',
@@ -125,7 +65,6 @@ export class WebFetchTool implements Tool {
       });
     } catch (err) {
       if (signal.aborted) throw err;
-      // Failures are not cached.
       return formatFetchFailure(url, err, inner.aborted);
     }
     const raw = await readCapped(resp.body, FETCH_BODY_CAP);
@@ -133,12 +72,7 @@ export class WebFetchTool implements Tool {
     if (text.length > FETCH_TEXT_CAP) {
       text = `${text.slice(0, FETCH_TEXT_CAP)}\n[... truncated ...]`;
     }
-    let result = `URL: ${url}\nStatus: ${resp.status} ${resp.statusText}\n\n${text}`;
-    if (privateReason) {
-      result = `note: private/internal host approved for this fetch (reason: ${privateReason})\n\n${result}`;
-    }
-    cacheSet(cacheKey, result);
-    return result;
+    return `URL: ${url}\nStatus: ${resp.status} ${resp.statusText}\n\n${text}`;
   }
 }
 
@@ -203,48 +137,6 @@ function hackerOneHandleFromPlatformPath(raw: string): string {
 const DDG_RESULT_RE =
   /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>[\s\S]*?<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
 
-// Degraded fallback: any anchor with an href + text, used only when the
-// structured result regex matches nothing.
-const ANCHOR_RE = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-
-/** Normalize a DDG result href: protocol-relative → https, unwrap /l/?uddg=. */
-function normalizeDDGUrl(rawUrl: string): string {
-  let url = rawUrl;
-  if (url.startsWith('//')) url = `https:${url}`;
-  try {
-    const u = new URL(url);
-    if (u.host === 'duckduckgo.com' && u.pathname === '/l/') {
-      const real = u.searchParams.get('uddg');
-      if (real) url = decodeURIComponent(real);
-    }
-  } catch {
-    // leave url as-is
-  }
-  return url;
-}
-
-/**
- * Extract up to 10 distinct http(s) result links from raw DDG HTML by scanning
- * every anchor. Drops DDG's own nav/relative anchors and empty-text links.
- */
-function extractAnchorResults(body: string): Array<[string, string]> {
-  const out: Array<[string, string]> = [];
-  const seen = new Set<string>();
-  ANCHOR_RE.lastIndex = 0;
-  let m: RegExpExecArray | null = ANCHOR_RE.exec(body);
-  while (m !== null && out.length < 10) {
-    const url = normalizeDDGUrl(m[1] ?? '');
-    const title = stripHTML(m[2] ?? '');
-    m = ANCHOR_RE.exec(body);
-    if (!title) continue;
-    if (!/^https?:\/\//i.test(url)) continue;
-    if (seen.has(url)) continue;
-    seen.add(url);
-    out.push([url, title]);
-  }
-  return out;
-}
-
 export class WebSearchTool implements Tool {
   name(): string {
     return 'web_search';
@@ -270,24 +162,13 @@ export class WebSearchTool implements Tool {
     if (!query) throw new Error('query is required');
     const endpoint = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
 
-    const cacheKey = `search:${query.trim()}`;
-    const cached = cacheGet(cacheKey);
-    if (cached !== undefined) return cached;
-
     const inner = AbortSignal.timeout(FETCH_TIMEOUT_MS);
     const combined = anySignal(signal, inner);
-    let resp: Response;
-    try {
-      resp = await fetch(endpoint, {
-        method: 'GET',
-        headers: { 'User-Agent': 'Mozilla/5.0 pentesterflow/0.1' },
-        signal: combined,
-      });
-    } catch (err) {
-      if (signal.aborted) throw err;
-      // Surface a structured failure like web_fetch instead of throwing raw.
-      return formatFetchFailure(endpoint, err, inner.aborted);
-    }
+    const resp = await fetch(endpoint, {
+      method: 'GET',
+      headers: { 'User-Agent': 'Mozilla/5.0 pentesterflow/0.1' },
+      signal: combined,
+    });
     const body = await readCapped(resp.body, SEARCH_BODY_CAP);
 
     const results: Array<[string, string, string]> = [];
@@ -300,31 +181,28 @@ export class WebSearchTool implements Tool {
     }
 
     if (results.length === 0) {
-      // Structured parse found nothing. If the body is non-empty the markup
-      // likely changed — fall back to raw anchor extraction and say so, rather
-      // than silently reporting zero results.
-      if (body.trim().length > 0) {
-        const anchors = extractAnchorResults(body);
-        if (anchors.length > 0) {
-          const out = anchors.map(([url, title], i) => `${i + 1}. ${title}\n   ${url}\n`);
-          const result = `degraded results (DuckDuckGo markup changed; extracted raw links):\n\n${out.join('\n')}`;
-          cacheSet(cacheKey, result);
-          return result;
-        }
-      }
       return 'no results parsed (DuckDuckGo may have changed its HTML; try web_fetch on a specific URL instead)';
     }
 
     const out: string[] = [];
     results.forEach(([rawUrl, rawTitle, rawSnippet], i) => {
-      const url = normalizeDDGUrl(rawUrl);
+      let url = rawUrl;
+      if (url.startsWith('//')) url = `https:${url}`;
+      // DDG sometimes wraps results in /l/?uddg=<real>; unwrap.
+      try {
+        const u = new URL(url);
+        if (u.host === 'duckduckgo.com' && u.pathname === '/l/') {
+          const real = u.searchParams.get('uddg');
+          if (real) url = decodeURIComponent(real);
+        }
+      } catch {
+        // leave url as-is
+      }
       const title = stripHTML(rawTitle);
       const snippet = stripHTML(rawSnippet);
       out.push(`${i + 1}. ${title}\n   ${url}\n   ${snippet}\n`);
     });
-    const result = out.join('\n');
-    cacheSet(cacheKey, result);
-    return result;
+    return out.join('\n');
   }
 }
 
